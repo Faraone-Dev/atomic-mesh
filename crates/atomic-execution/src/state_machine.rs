@@ -144,7 +144,7 @@ impl ExecutionEngine {
         &mut self,
         order_id: &str,
         fill_qty: Qty,
-        fill_price: Price,
+        _fill_price: Price,
         ts: u64,
     ) -> Result<bool, String> {
         let order = self.orders.get_mut(order_id).ok_or("order not found")?;
@@ -209,6 +209,15 @@ impl ExecutionEngine {
         self.orders
             .values()
             .filter(|o| !o.state.is_terminal())
+            .collect()
+    }
+
+    /// Return OrderIds of all non-terminal orders (for cancel-on-shutdown).
+    pub fn open_order_ids(&self) -> Vec<OrderId> {
+        self.orders
+            .values()
+            .filter(|o| !o.state.is_terminal())
+            .map(|o| o.order_id.clone())
             .collect()
     }
 

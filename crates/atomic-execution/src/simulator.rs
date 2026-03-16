@@ -1,4 +1,4 @@
-use atomic_core::event::{Event, EventPayload, OrderAckEvent, OrderFillEvent, OrderNewEvent};
+use atomic_core::event::{Event, EventPayload, OrderAckEvent, OrderFillEvent, OrderNewEvent, OrderRejectEvent};
 use atomic_core::types::{Level, OrderId, OrderType, Price, Qty, Side, Symbol, TimeInForce, Venue};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -29,6 +29,7 @@ impl Default for SimulatorConfig {
 
 /// A pending order resting in the simulated order book.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct SimOrder {
     order_id: OrderId,
     symbol: Symbol,
@@ -39,6 +40,7 @@ struct SimOrder {
     remaining: u64,
     time_in_force: TimeInForce,
     submitted_at: u64,
+    source: [u8; 32],
 }
 
 /// Internal order book for matching.
@@ -178,15 +180,67 @@ impl SimulatedExchange {
 
     /// Submit an order to the simulated exchange.
     pub fn submit_order(&mut self, order: &OrderNewEvent, timestamp: u64, source: [u8; 32]) {
-        // Generate ack
+        let key = order.symbol.pair();
+        let ack_ts = timestamp + self.config.ack_latency_ns;
+        let fill_ts = timestamp + self.config.fill_latency_ns;
+        let limit_price = match order.order_type {
+            OrderType::Market => None,
+            OrderType::Limit | OrderType::StopLimit => Some(order.price.0),
+            OrderType::StopMarket => None,
+        };
+
+        // FillOrKill: verify full liquidity is available before touching the book.
+        if order.time_in_force == TimeInForce::FillOrKill {
+            let available: u64 = self.books.get(&key).map_or(0, |book| {
+                let side = match order.side {
+                    Side::Buy => &book.asks,
+                    Side::Sell => &book.bids,
+                };
+                side.iter()
+                    .filter(|(&p, _)| match order.side {
+                        Side::Buy => limit_price.map_or(true, |lp| p <= lp),
+                        Side::Sell => limit_price.map_or(true, |lp| p >= lp),
+                    })
+                    .map(|(_, &q)| q)
+                    .sum()
+            });
+            if available < order.qty.0 {
+                self.pending_events.push_back(Event::new(
+                    0, ack_ts, source,
+                    EventPayload::OrderReject(OrderRejectEvent {
+                        order_id: order.order_id.clone(),
+                        reason: "fok_unfillable".to_string(),
+                        venue: Venue::Simulated,
+                    }),
+                ));
+                return;
+            }
+        }
+
+        // Market order: reject immediately if no liquidity on the matching side.
+        if order.order_type == OrderType::Market {
+            let has_liquidity = self.books.get(&key).map_or(false, |book| match order.side {
+                Side::Buy => !book.asks.is_empty(),
+                Side::Sell => !book.bids.is_empty(),
+            });
+            if !has_liquidity {
+                self.pending_events.push_back(Event::new(
+                    0, ack_ts, source,
+                    EventPayload::OrderReject(OrderRejectEvent {
+                        order_id: order.order_id.clone(),
+                        reason: "no_liquidity".to_string(),
+                        venue: Venue::Simulated,
+                    }),
+                ));
+                return;
+            }
+        }
+
+        // Generate ack.
         let exchange_id = format!("SIM-{}", self.next_exchange_id);
         self.next_exchange_id += 1;
-        let ack_ts = timestamp + self.config.ack_latency_ns;
-
         self.pending_events.push_back(Event::new(
-            0,
-            ack_ts,
-            source,
+            0, ack_ts, source,
             EventPayload::OrderAck(OrderAckEvent {
                 order_id: order.order_id.clone(),
                 exchange_order_id: exchange_id,
@@ -194,14 +248,7 @@ impl SimulatedExchange {
             }),
         ));
 
-        let key = order.symbol.pair();
-        let limit_price = match order.order_type {
-            OrderType::Market => None,
-            OrderType::Limit | OrderType::StopLimit => Some(order.price.0),
-            OrderType::StopMarket => None,
-        };
-
-        // Match against book
+        // Match against book.
         let result = if let Some(book) = self.books.get_mut(&key) {
             let book_side = match order.side {
                 Side::Buy => &mut book.asks,
@@ -209,31 +256,23 @@ impl SimulatedExchange {
             };
             match_order(book_side, order.side, order.qty.0, limit_price)
         } else {
-            MatchResult {
-                fills: Vec::new(),
-                remaining: order.qty.0,
-            }
+            MatchResult { fills: Vec::new(), remaining: order.qty.0 }
         };
 
-        // Generate fill events
-        let fill_ts = timestamp + self.config.fill_latency_ns;
-        let mut cumulative_remaining = result.remaining;
-
+        // Generate fill events, decrementing remaining correctly after each fill.
+        let mut remaining = order.qty.0;
         for fill in &result.fills {
-            let fee =
-                (fill.price * fill.qty as i64 * self.config.taker_fee_bps) / 10_000;
-
+            remaining = remaining.saturating_sub(fill.qty);
+            let fee = (fill.price * fill.qty as i64 * self.config.taker_fee_bps) / 10_000;
             self.pending_events.push_back(Event::new(
-                0,
-                fill_ts,
-                source,
+                0, fill_ts, source,
                 EventPayload::OrderFill(OrderFillEvent {
                     order_id: order.order_id.clone(),
                     symbol: order.symbol.clone(),
                     side: order.side,
                     price: Price(fill.price),
                     qty: Qty(fill.qty),
-                    remaining: Qty(cumulative_remaining),
+                    remaining: Qty(remaining),
                     fee,
                     is_maker: false,
                     venue: Venue::Simulated,
@@ -241,22 +280,41 @@ impl SimulatedExchange {
             ));
         }
 
-        // If remaining qty, rest as limit order
-        if result.remaining > 0 && order.order_type == OrderType::Limit {
-            self.resting_orders.insert(
-                order.order_id.0.clone(),
-                SimOrder {
-                    order_id: order.order_id.clone(),
-                    symbol: order.symbol.clone(),
-                    side: order.side,
-                    order_type: order.order_type,
-                    price: order.price,
-                    qty: order.qty,
-                    remaining: result.remaining,
-                    time_in_force: order.time_in_force,
-                    submitted_at: timestamp,
-                },
-            );
+        // Handle unfilled remaining qty.
+        if result.remaining > 0 {
+            match order.time_in_force {
+                TimeInForce::ImmediateOrCancel => {
+                    // Cancel the unfilled portion immediately.
+                    self.pending_events.push_back(Event::new(
+                        0, fill_ts, source,
+                        EventPayload::OrderCancel(atomic_core::event::OrderCancelEvent {
+                            order_id: order.order_id.clone(),
+                            reason: "ioc_expired".to_string(),
+                            venue: Venue::Simulated,
+                        }),
+                    ));
+                }
+                TimeInForce::GoodTilCancel | TimeInForce::GoodTilDate(_)
+                    if order.order_type == OrderType::Limit =>
+                {
+                    self.resting_orders.insert(
+                        order.order_id.0.clone(),
+                        SimOrder {
+                            order_id: order.order_id.clone(),
+                            symbol: order.symbol.clone(),
+                            side: order.side,
+                            order_type: order.order_type,
+                            price: order.price,
+                            qty: order.qty,
+                            remaining: result.remaining,
+                            time_in_force: order.time_in_force,
+                            submitted_at: timestamp,
+                            source,
+                        },
+                    );
+                }
+                _ => {}
+            }
         }
     }
 
@@ -316,23 +374,24 @@ impl SimulatedExchange {
                 continue;
             };
 
-            let source = [0u8; 32];
             let fill_ts = order.submitted_at + self.config.fill_latency_ns;
+            let mut remaining = order.remaining;
 
             for fill in &result.fills {
+                remaining = remaining.saturating_sub(fill.qty);
                 let fee =
                     (fill.price * fill.qty as i64 * self.config.maker_fee_bps) / 10_000;
                 self.pending_events.push_back(Event::new(
                     0,
                     fill_ts,
-                    source,
+                    order.source,
                     EventPayload::OrderFill(OrderFillEvent {
                         order_id: order.order_id.clone(),
                         symbol: order.symbol.clone(),
                         side: order.side,
                         price: Price(fill.price),
                         qty: Qty(fill.qty),
-                        remaining: Qty(result.remaining),
+                        remaining: Qty(remaining),
                         fee,
                         is_maker: true,
                         venue: Venue::Simulated,
@@ -523,5 +582,112 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].payload, EventPayload::OrderCancel(_)));
         assert_eq!(exchange.resting_order_count(), 0);
+    }
+
+    #[test]
+    fn ioc_cancel_on_partial_fill() {
+        let mut exchange = SimulatedExchange::new(SimulatorConfig::default());
+        setup_book(&mut exchange);
+
+        // Limit IOC buy at 60100 — only first ask level (50 qty) crosses; remaining 30 → cancel
+        let order = OrderNewEvent {
+            order_id: OrderId::new(Venue::Simulated, 1),
+            symbol: sym(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price: Price(60100),
+            qty: Qty(80),
+            time_in_force: TimeInForce::ImmediateOrCancel,
+            venue: Venue::Simulated,
+        };
+
+        exchange.submit_order(&order, 1000, [0u8; 32]);
+        let events = exchange.drain_events(1);
+
+        // ack + fill(s) + cancel
+        assert!(events.len() >= 3);
+        assert!(matches!(events[0].payload, EventPayload::OrderAck(_)));
+        let has_cancel = events.iter().any(|e| matches!(e.payload, EventPayload::OrderCancel(_)));
+        assert!(has_cancel, "IOC should cancel unfilled qty");
+        assert_eq!(exchange.resting_order_count(), 0, "IOC must not rest");
+    }
+
+    #[test]
+    fn market_reject_on_empty_book() {
+        let mut exchange = SimulatedExchange::new(SimulatorConfig::default());
+        // No book loaded
+
+        let order = OrderNewEvent {
+            order_id: OrderId::new(Venue::Simulated, 1),
+            symbol: sym(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Price(0),
+            qty: Qty(10),
+            time_in_force: TimeInForce::ImmediateOrCancel,
+            venue: Venue::Simulated,
+        };
+
+        exchange.submit_order(&order, 1000, [0u8; 32]);
+        let events = exchange.drain_events(1);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].payload, EventPayload::OrderReject(_)));
+    }
+
+    #[test]
+    fn fok_reject_if_insufficient_liquidity() {
+        let mut exchange = SimulatedExchange::new(SimulatorConfig::default());
+        setup_book(&mut exchange); // asks total: 50 + 100 + 200 = 350
+
+        let order = OrderNewEvent {
+            order_id: OrderId::new(Venue::Simulated, 1),
+            symbol: sym(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Price(0),
+            qty: Qty(500), // more than available
+            time_in_force: TimeInForce::FillOrKill,
+            venue: Venue::Simulated,
+        };
+
+        exchange.submit_order(&order, 1000, [0u8; 32]);
+        let events = exchange.drain_events(1);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].payload, EventPayload::OrderReject(_)));
+    }
+
+    #[test]
+    fn fill_remaining_decrements_correctly() {
+        let mut exchange = SimulatedExchange::new(SimulatorConfig::default());
+        // Two ask levels: 60100 x 50, 60200 x 100
+        let asks = vec![
+            Level { price: Price(60100), qty: Qty(50) },
+            Level { price: Price(60200), qty: Qty(100) },
+        ];
+        exchange.on_book_update(&sym(), &[], &asks, true);
+
+        let order = OrderNewEvent {
+            order_id: OrderId::new(Venue::Simulated, 1),
+            symbol: sym(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Price(0),
+            qty: Qty(120),
+            time_in_force: TimeInForce::ImmediateOrCancel,
+            venue: Venue::Simulated,
+        };
+
+        exchange.submit_order(&order, 1000, [0u8; 32]);
+        let events = exchange.drain_events(1);
+
+        // ack + fill@60100(50, remaining=70) + fill@60200(70, remaining=0)
+        let fills: Vec<_> = events.iter()
+            .filter_map(|e| if let EventPayload::OrderFill(f) = &e.payload { Some(f) } else { None })
+            .collect();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].remaining.0, 70, "after first fill remaining should be 70");
+        assert_eq!(fills[1].remaining.0, 0, "after second fill remaining should be 0");
     }
 }
