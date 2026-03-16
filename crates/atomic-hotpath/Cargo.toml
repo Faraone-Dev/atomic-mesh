@@ -1,0 +1,13 @@
+[package]
+name = "atomic-hotpath"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C++ hot-path FFI for nanosecond-scale order book + strategy processing"
+
+[dependencies]
+atomic-core = { path = "../atomic-core" }
+tracing = { workspace = true }
+
+[build-dependencies]
+cc = "1"

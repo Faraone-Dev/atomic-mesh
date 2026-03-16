@@ -1,7 +1,6 @@
 use atomic_core::error::{AtomicError, Result};
-use atomic_core::types::{Position, Price, Qty, Side, Symbol, Venue};
+use atomic_core::types::{Position, Price, Qty, Side, Symbol};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Risk limits configuration.
@@ -77,7 +76,7 @@ impl RiskEngine {
     /// Validate a new order against risk limits.
     pub fn check_order(
         &mut self,
-        symbol: &Symbol,
+        _symbol: &Symbol,
         side: Side,
         qty: Qty,
         price: Price,
@@ -167,5 +166,119 @@ impl RiskEngine {
 
     pub fn total_pnl(&self) -> i64 {
         self.total_pnl
+    }
+
+    pub fn open_order_count(&self) -> usize {
+        self.open_order_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomic_core::types::{Price, Qty, Side, Symbol, Venue};
+
+    fn sym() -> Symbol {
+        Symbol::new("BTC", "USDT", Venue::Binance)
+    }
+
+    fn engine(limits: RiskLimits) -> RiskEngine {
+        RiskEngine::new(limits)
+    }
+
+    #[test]
+    fn check_order_passes_within_limits() {
+        let mut risk = engine(RiskLimits::default());
+        let result = risk.check_order(&sym(), Side::Buy, Qty(1_000_000), Price(50_000), None, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reject_exceeds_max_order_qty() {
+        let limits = RiskLimits { max_order_qty: 100, ..Default::default() };
+        let mut risk = engine(limits);
+        let result = risk.check_order(&sym(), Side::Buy, Qty(200), Price(50_000), None, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_exceeds_max_open_orders() {
+        let limits = RiskLimits { max_open_orders: 2, ..Default::default() };
+        let mut risk = engine(limits);
+        risk.on_order_opened();
+        risk.on_order_opened();
+        let result = risk.check_order(&sym(), Side::Buy, Qty(100), Price(50_000), None, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn kill_switch_on_max_loss() {
+        let limits = RiskLimits { max_loss: -1000, ..Default::default() };
+        let mut risk = engine(limits);
+        risk.update_pnl(-2000);
+        let result = risk.check_order(&sym(), Side::Buy, Qty(100), Price(50_000), None, 0);
+        assert!(result.is_err());
+        assert!(risk.is_killed());
+    }
+
+    #[test]
+    fn kill_switch_blocks_all_orders() {
+        let mut risk = engine(RiskLimits::default());
+        risk.activate_kill_switch("test");
+        let result = risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reset_kill_switch_allows_orders() {
+        let mut risk = engine(RiskLimits::default());
+        risk.activate_kill_switch("test");
+        assert!(risk.is_killed());
+        risk.reset_kill_switch();
+        assert!(!risk.is_killed());
+        let result = risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rate_limit_rejects_burst() {
+        let limits = RiskLimits { max_orders_per_second: 3, ..Default::default() };
+        let mut risk = engine(limits);
+        let ts = 1_000_000_000_000u64; // some timestamp in nanos
+        assert!(risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, ts).is_ok());
+        assert!(risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, ts + 100).is_ok());
+        assert!(risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, ts + 200).is_ok());
+        // 4th within same second → reject
+        assert!(risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, ts + 300).is_err());
+    }
+
+    #[test]
+    fn rate_limit_resets_after_one_second() {
+        let limits = RiskLimits { max_orders_per_second: 2, ..Default::default() };
+        let mut risk = engine(limits);
+        let ts = 1_000_000_000_000u64;
+        assert!(risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, ts).is_ok());
+        assert!(risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, ts + 100).is_ok());
+        // Next second
+        assert!(risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, ts + 1_000_000_001).is_ok());
+    }
+
+    #[test]
+    fn pnl_tracking() {
+        let mut risk = engine(RiskLimits::default());
+        assert_eq!(risk.total_pnl(), 0);
+        risk.update_pnl(500);
+        risk.update_pnl(-200);
+        assert_eq!(risk.total_pnl(), 300);
+    }
+
+    #[test]
+    fn position_limit_check() {
+        let limits = RiskLimits { max_position_qty: 1000, ..Default::default() };
+        let mut risk = engine(limits);
+        let pos = Position::flat(sym());
+        // Within limit
+        let result = risk.check_order(&sym(), Side::Buy, Qty(800), Price(1), Some(&pos), 0);
+        assert!(result.is_ok());
     }
 }
