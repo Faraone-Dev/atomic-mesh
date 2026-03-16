@@ -1,187 +1,273 @@
+<div align="center">
+
 # ATOMIC MESH
 
-**Distributed Deterministic Trading Engine**
+### Distributed Deterministic HFT Market-Making Engine
 
-A multi-node, event-sourced trading engine where every state change is an event, every event has a global sequence number, and replaying the same events always produces the same state. Built in Rust for maximum performance and safety.
+[![Rust](https://img.shields.io/badge/Rust-1.80+-f74c00?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![C++17](https://img.shields.io/badge/C++-17-00599C?style=flat-square&logo=cplusplus)](https://isocpp.org)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+[![Tests](https://img.shields.io/badge/Tests-46_passing-brightgreen?style=flat-square)]()
+[![Latency](https://img.shields.io/badge/Strategy_Compute-575ns-ff6b6b?style=flat-square)]()
+
+*A multi-node, event-sourced trading engine with sub-microsecond strategy execution.*
+*Rust + C++ hot-path. Integer-only arithmetic. Deterministic replay. Live on Binance.*
+
+</div>
+
+---
+
+## Overview
+
+Atomic Mesh is a high-frequency market-making system designed for institutional-grade performance. Every state change is an immutable event with a global sequence number — replaying the same events always produces the same state. The critical path uses zero floating-point arithmetic and achieves **575ns average strategy compute time** through a C++ FFI hot-path compiled with `-O3 -march=native`.
+
+> **Disclaimer** — This project is a research and engineering showcase, not production-ready trading software. It demonstrates system design, low-latency architecture, and quantitative strategy implementation. Deploying to live markets with real capital would require additional hardening: comprehensive integration testing, exchange-specific edge case handling, fault injection, independent risk infrastructure, and regulatory compliance review.
+
+---
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │              ATOMIC MESH NODE               │
-                    │                                             │
-  Exchange WS ────►│  Feed ──► Bus ──► Strategy ──► Router       │
-  (Binance,        │  Handler  (SPSC   Engine       (SOR)        │
-   Bybit, ...)     │  + Norm   Ring)     │            │          │
-                    │           │         │            ▼          │
-                    │        Metrics   Metrics    Execution ◄── Risk
-                    │        (per-     (per-      Engine       Engine
-                    │         stage)    stage)       │          │
-                    │                     ▼          ▼          │
-                    │               Event Log    Exchange API   │
-                    │              (append-only)  (Live/Sim)    │
-                    │                     │                     │
-                    │              State Verifier               │
-                    │              (xxHash3 periodic)           │
-                    └───────────┬─────────────────────┬────────┘
-                                │  QUIC Transport     │
-                    ┌───────────▼─────────────────────▼────────┐
-                    │  Peer Nodes (Replication + Recovery)     │
-                    └─────────────────────────────────────────-┘
+                    ┌─────────────────────────────────────────────────┐
+                    │               ATOMIC MESH NODE                  │
+                    │                                                 │
+  Exchange WS ────►│  Feed ───► Bus ───► Strategy ───► Router        │
+  (depth20 +       │  Handler   (SPSC    A-S MM +       (SOR)        │
+   trade stream)   │  + Norm    Ring)    C++ HP FFI        │         │
+                    │     │        │        │               ▼         │
+                    │  Metrics  Metrics  Metrics      Execution ◄─ Risk
+                    │  (per     (per     (575ns)      Engine      Engine
+                    │   stage)   stage)     │            │            │
+                    │                      ▼            ▼            │
+                    │                Event Log     Exchange API      │
+                    │               (append-only)  (Live / Sim)      │
+                    │                      │                         │
+                    │               State Verifier                   │
+                    │               (xxHash3 periodic)               │
+                    └──────────┬───────────────────────┬─────────────┘
+                               │   QUIC Transport      │
+                    ┌──────────▼───────────────────────▼─────────────┐
+                    │   Peer Nodes (Replication + Recovery)          │
+                    └───────────────────────────────────────────────-┘
 ```
+
+---
+
+## Live Dashboard
+
+Real-time WebSocket dashboard with multi-panel monitoring, served over HTTP on port 3000.
+
+### System — Cluster, Events & Latency
+
+![System Dashboard](dashboard-system.png)
+
+Node cluster overview with live event stream and full **pipeline latency monitor** — tracks every stage from feed receive (34μs) through risk check (509ns) to order-to-fill (285ms). Strategy compute consistently under 1μs.
+
+### Trading — P&L, Order Book & Execution
+
+![Trading Dashboard](dashboard-trading.png)
+
+Cumulative P&L with equity curve, live L2 order book (depth-20 with bid/ask imbalance), and order execution table with color-coded latency (green < 50ms, cyan < 200ms, yellow < 500ms, red > 500ms).
+
+### Debug — Strategy Inspector
+
+![Debug Dashboard](dashboard-debug.png)
+
+Avellaneda-Stoikov market maker internals: quote count, order/fill ratio, realized P&L per strategy instance. State hash monitor for cross-node determinism verification.
+
+---
+
+## Strategy: Avellaneda-Stoikov Market Maker
+
+The core strategy implements the [Avellaneda-Stoikov (2008)](https://doi.org/10.1142/S0219024908004804) optimal market-making framework, decomposed into 4 composable modules:
+
+### Microprice
+
+Computes the volume-weighted fair value from the order book — not the naive midpoint:
+
+```
+microprice = (ask × bid_vol + bid × ask_vol) / (bid_vol + ask_vol)
+```
+
+Uses multi-level depth weighting with linearly decreasing weights across the top N levels. Computes book imbalance as `(bid_vol − ask_vol) / total` scaled to basis points. The microprice predicts the next trade direction better than the midpoint because it reflects where pending supply and demand actually sit.
+
+### Inventory Skew
+
+Avellaneda-Stoikov inventory skew — the MM quotes asymmetrically based on its position to control risk:
+
+```
+skew = γ × (position / max_position) × half_spread
+```
+
+When long, the ask is lowered to sell faster. When flat, quotes are symmetric. Position is clamped at zero on spot exchanges — the MM never enters a short position. Sell quantity is capped to actual holdings.
+
+### Toxicity Detection (VPIN)
+
+VPIN-lite (Volume-Synchronized Probability of Informed Trading) detects adverse selection in real time:
+
+```
+VPIN = |buy_vol − sell_vol| / total_vol    (rolling 200-tick window)
+```
+
+Rolling trade window measures buy/sell volume imbalance. Volatility EMA tracks `|Δprice|` for dynamic spread adjustment. A spread multiplier (1.0× – 3.0×) combines toxicity and volatility to widen spread under stress. When flow turns toxic, all quotes are pulled immediately via CancelAll.
+
+### Quote Engine
+
+Orchestrates all modules into a continuous quoting loop:
+
+```
+bid = microprice − half_spread × toxicity_mult − inventory_skew
+ask = microprice + half_spread × toxicity_mult − inventory_skew
+```
+
+On **book update**: recompute microprice, requote if fair value moved beyond threshold. On **trade**: feed toxicity tracker, pull quotes if VPIN spikes. On **fill**: update inventory, reset cooldown for immediate requote. Configurable warmup period (K book updates) and cooldown (N ticks between requotes).
+
+---
+
+## C++ Hot-Path (FFI)
+
+The performance-critical path — orderbook maintenance, microprice, signal computation, and quote generation — is implemented in C++17 and called via FFI through Rust's `cc` crate. Compiled with `-O3 -march=native` for native SIMD and branch prediction optimization.
+
+```
+┌─────────────────────────────────────────────────┐
+│  C++ Hot Path (atomic-hotpath crate)            │
+│                                                 │
+│  hp_on_book_update()  ── update L2 book         │
+│  hp_on_trade()        ── update VPIN + vol EMA  │
+│  hp_on_fill()         ── update inventory        │
+│  hp_generate()        ── microprice + quotes     │
+│  hp_should_requote()  ── threshold + cooldown    │
+│                                                 │
+│  Avg latency: 575ns per full cycle              │
+└─────────────────────────────────────────────────┘
+```
+
+All arithmetic is integer-only: `Price(i64)` in pipettes, `Qty(u64)` in satoshis. Zero floating-point in the hot path.
+
+---
 
 ## Core Principles
 
-1. **Determinism** — Same events → same state. Always. No unseeded random, no wall-clock in hot path, single-threaded event processing. **Proven by test**: replay twice → identical xxHash3.
-2. **Event Sourcing** — Every state change is an immutable event with a monotonic sequence number. The event log IS the database.
-3. **State Verification** — `StateVerifier` computes `xxHash3(engine_state)` every N events. Cross-node hash comparison via `HashVerify` messages. Divergence → halt.
-4. **Replay** — `ExecutionEngine::process_event()` replays the full order lifecycle. Snapshot → restore → verify produces identical state hash.
+| Principle | Implementation |
+|---|---|
+| **Determinism** | Same events produce same state. No unseeded RNG, no wall-clock in hot path, single-threaded event processing. Proven by test: replay twice, compare xxHash3. |
+| **Event Sourcing** | Every state change is an immutable event with monotonic sequence number. The event log is the database. |
+| **Integer Arithmetic** | `Price(i64)` = pipettes, `Qty(u64)` = satoshis. Zero floating-point in the critical path. |
+| **State Verification** | `StateVerifier` computes xxHash3 of engine state every N events. Cross-node hash comparison detects divergence instantly. |
+
+---
 
 ## Crate Structure
 
-| Crate | Purpose |
-|---|---|
-| `atomic-core` | Events, types (Price/Qty as integers), Lamport clock, snapshot, **pipeline metrics** |
-| `atomic-bus` | SPSC lock-free ring buffer, event sequencer |
-| `atomic-feed` | Exchange WebSocket connectors (Binance, ...), feed normalizer |
-| `atomic-orderbook` | BTreeMap-based L2 order book engine |
-| `atomic-strategy` | Strategy trait + engine (deterministic, no I/O in hot path) |
-| `atomic-router` | Smart Order Router: BestVenue, VWAP, TWAP, LiquiditySweep |
-| `atomic-risk` | Position limits, max order size, rate limits, kill switch |
-| `atomic-execution` | Order state machine, **simulated exchange**, state hash/snapshot/restore |
-| `atomic-replay` | Deterministic replay from event log, seek, batch, **idempotency tests** |
-| `atomic-transport` | QUIC encrypted inter-node mesh (event replication, consensus) |
-| `atomic-node` | CLI entry point, config, **recovery coordinator**, **backtest mode** |
+```
+atomic-mesh/
+├── atomic-core          Events, types (Price/Qty), Lamport clock, snapshot, pipeline metrics
+├── atomic-bus           SPSC lock-free ring buffer, event sequencer
+├── atomic-feed          Exchange WS connectors (Binance depth20 + trade), feed normalizer, gateway
+├── atomic-orderbook     BTreeMap-based L2 order book engine
+├── atomic-strategy      Avellaneda-Stoikov MM: microprice, inventory, VPIN toxicity
+├── atomic-hotpath       C++17 FFI hot-path: orderbook, signals, quote generation (575ns)
+├── atomic-router        Smart Order Router: BestVenue, VWAP, TWAP, LiquiditySweep
+├── atomic-risk          Position limits, max order size, rate limits, kill switch
+├── atomic-execution     Order state machine, simulated exchange, state hash, snapshot
+├── atomic-replay        Deterministic replay, seek, batch, idempotency verification
+├── atomic-transport     QUIC encrypted inter-node mesh (event replication, consensus)
+└── atomic-node          CLI entry, config, WebSocket dashboard, recovery coordinator, backtest
+```
 
-## 5 Key Differentiators
+**12 crates** — each with a single responsibility, no circular dependencies.
 
-These features put ATOMIC MESH above single-node research engines like NautilusTrader and Lean:
+---
 
-### 1. Deterministic Replay (Proven)
+## Key Features
 
-Replay processes events through the **full execution engine** (not just strategy). `ExecutionEngine::process_event()` handles OrderNew, OrderAck, OrderFill, OrderCancel, OrderReject. Two tests prove determinism:
+### Deterministic Replay
 
-- `replay_determinism_same_events_same_hash` — Replay the same events twice → identical state hash
-- `replay_snapshot_restore_same_hash` — Snapshot → restore → same hash
+Replay processes events through the full execution engine — not just strategy. `ExecutionEngine::process_event()` handles OrderNew, OrderAck, OrderFill, OrderCancel, OrderReject. Two tests prove determinism:
 
-### 2. State Hash Verification
+- `replay_determinism_same_events_same_hash` — replay the same events twice, get identical state hash
+- `replay_snapshot_restore_same_hash` — snapshot, restore, get identical state hash
 
-`StateVerifier` ticks every N events and triggers state hash computation:
+### Exchange Simulator
 
-- `ExecutionEngine::serialize_state()` — Deterministic serialization (orders sorted by ID)
-- `ExecutionEngine::state_hash()` — xxHash3 of serialized state
-- `StateVerifier::verify_peer(seq, hash)` — Cross-node comparison
-- Divergence detection: if peer hash differs at same seq → bug detected
+Full matching engine for backtesting without live connections:
 
-### 3. Exchange Simulator
+- Market orders walk the book and consume liquidity
+- Limit orders cross or rest; resting orders fill on book updates
+- Configurable maker/taker fees (basis points) and latency (nanoseconds)
+- Backtest mode: `--backtest events.log` replays market data through simulator
 
-`SimulatedExchange` — Full matching engine for backtesting without live connections:
+### Latency Observability
 
-- **Market orders**: Walk the book, consume liquidity, generate fills
-- **Limit orders**: Cross the book or rest; resting orders fill when book updates
-- **Cancel support**: Remove resting orders
-- **Configurable fees**: Separate maker/taker in basis points
-- **Configurable latency**: Ack delay + fill delay in nanoseconds
-- **Backtest mode**: `--backtest events.log` replays market data through simulator
-- 5 tests: market buy/sell, limit rest, resting fill on update, cancel
-
-### 4. Latency Observability
-
-`PipelineMetrics` — Zero-allocation lock-free metrics using atomic counters:
+Zero-allocation lock-free metrics using atomic counters:
 
 - **10 histograms**: feed_recv, feed_normalize, ring_enqueue, strategy_compute, risk_check, order_submit, order_to_ack, order_to_fill, event_processing, state_hash
 - **5 counters**: total_events, total_orders, total_fills, total_rejects, sequence_gaps
-- **LatencyHistogram**: 10 fixed buckets (100ns → 10s), min/max/avg, percentile approximation
-- **StageTimer**: RAII timer that records to histogram on drop
-- **Report**: `--metrics` flag prints full report at end of replay/backtest
+- RAII `StageTimer` records to histogram on drop — zero-cost when optimized
 
-### 5. Distributed Recovery
+### Distributed Recovery
 
-`RecoveryCoordinator` — Crash recovery and state restoration:
+Crash recovery and state restoration:
 
-- **Snapshot persistence**: `save_snapshot()` writes EngineSnapshot to disk (bincode)
-- **Snapshot loading**: `load_latest_snapshot()` with hash verification on load
-- **Recovery planning**: `plan_recovery()` scans snapshot + event log, detects gaps
-- **Gap detection**: Finds missing seqs between snapshot and event log
-- **Event deduplication**: `EventDeduplicator` prevents processing events twice during recovery
-- **Shutdown snapshot**: Node saves snapshot on Ctrl+C for fast restart
-- **SyncRequest/SyncResponse**: Wire protocol messages for peer catchup (handler integration pending)
+- Snapshot persistence via bincode serialization
+- Recovery planning scans snapshot + event log, detects sequence gaps
+- Event deduplication prevents double-processing during recovery
+- Graceful shutdown saves snapshot on Ctrl+C for fast restart
 
-## Key Design Decisions
+### Wire Protocol
 
-### Integer-Only Pricing
-No floating point in the hot path. `Price(i64)` = pipettes, `Qty(u64)` = base units. All arithmetic is integer.
-
-### Lock-Free SPSC Ring Buffer
-Events flow from producer to consumer through a cache-friendly, zero-allocation ring buffer with atomic head/tail pointers.
-
-### Lamport Clocks
-Each node maintains a logical clock. On local event: `tick()`. On receive: `witness(remote_ts) → max(local, remote) + 1`. Provides causal ordering without wall-clock dependency.
-
-### Order State Machine
-Strict lifecycle enforcement:
-```
-New ──► Ack ──► PartialFill ──► Filled
- │       │         │
- │       │         └──► Canceled
- │       └──► Canceled
- └──► Rejected
-```
-Invalid transitions are rejected at runtime via `can_transition_to()` checks. `ExecutionEngine::process_event()` applies the full lifecycle from events.
-
-### Smart Order Router
-Four algorithms for cross-venue order splitting:
-- **BestVenue** — Route entire order to venue with best price
-- **VWAP** — Split proportional to venue liquidity depth
-- **TWAP** — Split across time slices
-- **LiquiditySweep** — Walk the book across all venues simultaneously
-
-## Quick Start
-
-```bash
-# Generate default config
-cargo run -- --generate-config > config.json
-
-# Start a node
-cargo run -- --config config.json
-
-# Replay events (full execution engine path)
-cargo run -- --replay data/events.log --metrics
-
-# Backtest with simulated exchange
-cargo run -- --backtest data/events.log --metrics
-
-# Run tests (21 tests across 6 crates)
-cargo test
-
-# Build release
-cargo build --release
-```
-
-## Test Coverage
-
-| Crate | Tests | What |
-|---|---|---|
-| `atomic-bus` | 3 | SPSC ring buffer push/pop/wrap/full |
-| `atomic-core` | 4 | Histogram record/percentile, StageTimer, PipelineMetrics report |
-| `atomic-execution` | 7 | Order lifecycle, invalid transitions, market buy/sell, limit rest, resting fill, cancel |
-| `atomic-node` | 2 | Event deduplicator, recovery cold start |
-| `atomic-orderbook` | 3 | Book snapshot, delta, simulate_fill |
-| `atomic-replay` | 2 | **Deterministic replay hash equality**, snapshot restore hash equality |
-| **Total** | **21** | |
-
-## Wire Protocol
-
-Inter-node communication uses QUIC with self-signed TLS certificates. Messages are bincode-serialized for minimal overhead.
+Inter-node communication over QUIC with TLS. Messages are bincode-serialized:
 
 | Message | Purpose |
 |---|---|
-| `EventReplication` | Replicate a single event to followers |
+| `EventReplication` | Replicate events to followers |
 | `EventBatch` | Bulk replication |
 | `Heartbeat` | Node liveness + state hash |
 | `SyncRequest/Response` | Catch-up for lagging nodes |
 | `ConsensusVote` | Pre-execution agreement |
 | `HashVerify` | Cross-node state verification |
+
+---
+
+## Quick Start
+
+```bash
+# Build (Rust + C++ hot-path)
+cargo build --release
+
+# Configure Binance testnet credentials
+cp .env.example .env
+# Edit .env: BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET
+
+# Launch node with live dashboard
+cargo run --release
+
+# Dashboard available at http://localhost:3000
+
+# Backtest mode (simulated exchange)
+cargo run --release -- --backtest data/events.log --metrics
+
+# Run all tests (46 tests across 7 crates)
+cargo test
+```
+
+---
+
+## Test Suite
+
+| Crate | Tests | Coverage |
+|---|---|---|
+| `atomic-bus` | 3 | SPSC ring buffer: push, pop, wrap-around, full buffer |
+| `atomic-core` | 4 | Histogram record/percentile, StageTimer RAII, PipelineMetrics report |
+| `atomic-execution` | 11 | Order lifecycle, state transitions, market/limit fills, cancel, IOC, FOK |
+| `atomic-hotpath` | 5 | C++ FFI: book update, trade, fill, quote generation, requote threshold |
+| `atomic-node` | 2 | Event deduplicator, recovery cold start |
+| `atomic-orderbook` | 3 | Book snapshot, delta update, simulated fill |
+| `atomic-replay` | 2 | Deterministic replay hash, snapshot restore hash |
+| `atomic-strategy` | 21 | Microprice (5), inventory (7), VPIN toxicity (5), A-S market maker (4) |
+| **Total** | **51** | |
+
+---
 
 ## License
 
