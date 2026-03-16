@@ -18,6 +18,7 @@ atomic-risk = { path = "../atomic-risk" }
 atomic-execution = { path = "../atomic-execution" }
 atomic-replay = { path = "../atomic-replay" }
 atomic-transport = { path = "../atomic-transport" }
+atomic-hotpath = { path = "../atomic-hotpath" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }
@@ -26,3 +27,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+dotenvy = "0.15"
+axum = { version = "0.8", features = ["ws"] }

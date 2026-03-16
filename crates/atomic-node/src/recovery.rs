@@ -34,6 +34,10 @@ impl RecoveryCoordinator {
         }
     }
 
+    pub fn event_log_path(&self) -> &str {
+        &self.event_log_path
+    }
+
     /// Save a snapshot to disk.
     pub fn save_snapshot(&self, snapshot: &EngineSnapshot) -> std::io::Result<()> {
         fs::create_dir_all(&self.snapshot_dir)?;

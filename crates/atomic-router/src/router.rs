@@ -218,3 +218,98 @@ impl Default for SmartOrderRouter {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomic_core::types::{Level, Price, Qty, Side, Symbol, Venue};
+    use atomic_orderbook::OrderBook;
+
+    fn sym(venue: Venue) -> Symbol {
+        Symbol::new("BTC", "USDT", venue)
+    }
+
+    fn book_with_levels(symbol: Symbol, bids: &[(i64, u64)], asks: &[(i64, u64)]) -> OrderBook {
+        let mut book = OrderBook::new(symbol);
+        let bid_levels: Vec<Level> = bids.iter().map(|(p, q)| Level { price: Price(*p), qty: Qty(*q) }).collect();
+        let ask_levels: Vec<Level> = asks.iter().map(|(p, q)| Level { price: Price(*p), qty: Qty(*q) }).collect();
+        book.apply_snapshot(&bid_levels, &ask_levels, 1, 0);
+        book
+    }
+
+    #[test]
+    fn best_venue_picks_lowest_ask_for_buy() {
+        let mut router = SmartOrderRouter::new();
+        let s1 = sym(Venue::Binance);
+        let s2 = sym(Venue::Bybit);
+        router.update_book(&s1.pair(), Venue::Binance, book_with_levels(s1.clone(), &[(99, 10)], &[(101, 10)]));
+        router.update_book(&s2.pair(), Venue::Bybit, book_with_levels(s2.clone(), &[(99, 10)], &[(100, 10)]));
+
+        let slices = router.route(&s1, Side::Buy, Qty(5), RoutingAlgo::BestVenue);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].venue, Venue::Bybit);
+        assert_eq!(slices[0].price, Price(100));
+    }
+
+    #[test]
+    fn best_venue_picks_highest_bid_for_sell() {
+        let mut router = SmartOrderRouter::new();
+        let s1 = sym(Venue::Binance);
+        let s2 = sym(Venue::Bybit);
+        router.update_book(&s1.pair(), Venue::Binance, book_with_levels(s1.clone(), &[(102, 10)], &[(105, 10)]));
+        router.update_book(&s2.pair(), Venue::Bybit, book_with_levels(s2.clone(), &[(100, 10)], &[(105, 10)]));
+
+        let slices = router.route(&s1, Side::Sell, Qty(5), RoutingAlgo::BestVenue);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].venue, Venue::Binance);
+        assert_eq!(slices[0].price, Price(102));
+    }
+
+    #[test]
+    fn vwap_splits_proportional_to_depth() {
+        let mut router = SmartOrderRouter::new();
+        let s1 = sym(Venue::Binance);
+        let s2 = sym(Venue::Bybit);
+        // Binance: 30 depth, Bybit: 10 depth → 75%/25% split
+        router.update_book(&s1.pair(), Venue::Binance, book_with_levels(s1.clone(), &[(99, 30)], &[(101, 30)]));
+        router.update_book(&s2.pair(), Venue::Bybit, book_with_levels(s2.clone(), &[(99, 10)], &[(101, 10)]));
+
+        let slices = router.route(&s1, Side::Buy, Qty(100), RoutingAlgo::VWAP);
+        assert_eq!(slices.len(), 2);
+        let total_qty: u64 = slices.iter().map(|s| s.qty.0).sum();
+        assert_eq!(total_qty, 100);
+    }
+
+    #[test]
+    fn twap_splits_into_equal_slices() {
+        let mut router = SmartOrderRouter::new();
+        let s = sym(Venue::Binance);
+        router.update_book(&s.pair(), Venue::Binance, book_with_levels(s.clone(), &[(99, 100)], &[(101, 100)]));
+
+        let slices = router.route(&s, Side::Buy, Qty(100), RoutingAlgo::TWAP { slices: 4, interval_ms: 1000 });
+        assert_eq!(slices.len(), 4);
+        for slice in &slices {
+            assert_eq!(slice.qty, Qty(25));
+        }
+    }
+
+    #[test]
+    fn sweep_fills_across_levels() {
+        let mut router = SmartOrderRouter::new();
+        let s = sym(Venue::Binance);
+        router.update_book(&s.pair(), Venue::Binance, book_with_levels(s.clone(), &[(99, 50)], &[(100, 20), (101, 30)]));
+
+        let slices = router.route(&s, Side::Buy, Qty(40), RoutingAlgo::LiquiditySweep);
+        assert!(!slices.is_empty());
+        let total_qty: u64 = slices.iter().map(|s| s.qty.0).sum();
+        assert_eq!(total_qty, 40);
+    }
+
+    #[test]
+    fn empty_book_returns_no_slices() {
+        let router = SmartOrderRouter::new();
+        let s = sym(Venue::Binance);
+        let slices = router.route(&s, Side::Buy, Qty(100), RoutingAlgo::BestVenue);
+        assert!(slices.is_empty());
+    }
+}

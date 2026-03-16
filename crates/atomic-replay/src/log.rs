@@ -1,7 +1,6 @@
 use atomic_core::event::Event;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
 
 /// Append-only event log backed by a file.
 /// Format: [4-byte length][bincode-encoded Event]...

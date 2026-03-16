@@ -1,10 +1,10 @@
 use atomic_core::event::Event;
-use atomic_core::snapshot::EngineSnapshot;
 use crate::log::EventLog;
 
 /// Replay player: reads events from a log and replays them deterministically.
 /// The core guarantee: replay(events.log) → identical state every time.
 pub struct ReplayPlayer {
+    #[allow(dead_code)]
     log: EventLog,
     current_index: usize,
     events: Vec<Event>,

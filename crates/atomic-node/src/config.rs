@@ -14,6 +14,52 @@ pub struct NodeConfig {
     pub risk: RiskLimits,
     pub event_log_path: String,
     pub snapshot_interval: u64,
+    #[serde(default)]
+    pub gateway: GatewaySettings,
+}
+
+/// Exchange gateway settings.
+/// API keys are loaded from environment variables for security.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewaySettings {
+    /// "live" or "testnet"
+    pub mode: String,
+    /// Env var name for API key (default: ATOMIC_API_KEY)
+    pub api_key_env: String,
+    /// Env var name for API secret (default: ATOMIC_API_SECRET)
+    pub api_secret_env: String,
+    /// If true, orders are actually sent. If false, only logged (paper mode).
+    pub enabled: bool,
+}
+
+impl Default for GatewaySettings {
+    fn default() -> Self {
+        Self {
+            mode: "testnet".to_string(),
+            api_key_env: "ATOMIC_API_KEY".to_string(),
+            api_secret_env: "ATOMIC_API_SECRET".to_string(),
+            enabled: false,
+        }
+    }
+}
+
+impl GatewaySettings {
+    /// Reads API key from the environment variable specified in config.
+    pub fn api_key(&self) -> Result<String, String> {
+        std::env::var(&self.api_key_env)
+            .map_err(|_| format!("env var '{}' not set", self.api_key_env))
+    }
+
+    /// Reads API secret from the environment variable specified in config.
+    pub fn api_secret(&self) -> Result<String, String> {
+        std::env::var(&self.api_secret_env)
+            .map_err(|_| format!("env var '{}' not set", self.api_secret_env))
+    }
+
+    /// Returns true if mode is "testnet".
+    pub fn is_testnet(&self) -> bool {
+        self.mode == "testnet"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +92,7 @@ impl Default for NodeConfig {
             risk: RiskLimits::default(),
             event_log_path: "data/events.log".to_string(),
             snapshot_interval: 10000,
+            gateway: GatewaySettings::default(),
         }
     }
 }
