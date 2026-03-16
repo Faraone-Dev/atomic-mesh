@@ -1,0 +1,31 @@
+{
+  "node_id": "node-0",
+  "role": "Leader",
+  "bind_addr": "0.0.0.0:5001",
+  "peers": [],
+  "feeds": [
+    {
+      "venue": "Binance",
+      "symbols": ["BTCUSDT"],
+      "price_decimals": 2,
+      "qty_decimals": 8
+    }
+  ],
+  "risk": {
+    "max_position_qty": 100000000,
+    "max_notional": 500000000000,
+    "max_total_notional": 1000000000000,
+    "max_order_qty": 10000000,
+    "max_open_orders": 10,
+    "max_loss": -50000000,
+    "max_orders_per_second": 50
+  },
+  "event_log_path": "data/events.log",
+  "snapshot_interval": 10000,
+  "gateway": {
+    "mode": "testnet",
+    "api_key_env": "ATOMIC_API_KEY",
+    "api_secret_env": "ATOMIC_API_SECRET",
+    "enabled": true
+  }
+}

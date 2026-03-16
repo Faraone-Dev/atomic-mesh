@@ -1,0 +1,17 @@
+[package]
+name = "atomic-feed"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atomic-core = { path = "../atomic-core" }
+atomic-bus = { path = "../atomic-bus" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+url = "2"
+futures-util = "0.3"

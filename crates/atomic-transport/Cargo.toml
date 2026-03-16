@@ -1,0 +1,16 @@
+[package]
+name = "atomic-transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atomic-core = { path = "../atomic-core" }
+serde = { workspace = true }
+bincode = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

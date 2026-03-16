@@ -1,0 +1,10 @@
+[package]
+name = "atomic-risk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atomic-core = { path = "../atomic-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

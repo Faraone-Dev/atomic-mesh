@@ -1,0 +1,9 @@
+[package]
+name = "atomic-strategy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atomic-core = { path = "../atomic-core" }
+atomic-orderbook = { path = "../atomic-orderbook" }
+serde = { workspace = true }

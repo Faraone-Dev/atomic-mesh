@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo lock is committed for binaries (this is a binary project)
+# Cargo.lock — KEEP in repo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Snapshots and runtime data
+*_snapshots/
+*.enc
+
+# Logs
+*.log
+
+# Secrets — NEVER commit
+.env

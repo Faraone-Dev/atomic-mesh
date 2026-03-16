@@ -1,0 +1,95 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/atomic-core",
+    "crates/atomic-bus",
+    "crates/atomic-feed",
+    "crates/atomic-orderbook",
+    "crates/atomic-strategy",
+    "crates/atomic-router",
+    "crates/atomic-risk",
+    "crates/atomic-execution",
+    "crates/atomic-replay",
+    "crates/atomic-transport",
+    "crates/atomic-hotpath",
+    "crates/atomic-node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["conditional-team"]
+repository = "https://github.com/conditional-team/atomic-mesh"
+description = "Distributed deterministic trading engine"
+keywords = ["trading", "deterministic", "distributed", "hft", "mesh"]
+categories = ["finance", "network-programming"]
+
+[workspace.dependencies]
+# Internal crates
+atomic-core = { path = "crates/atomic-core" }
+atomic-bus = { path = "crates/atomic-bus" }
+atomic-feed = { path = "crates/atomic-feed" }
+atomic-orderbook = { path = "crates/atomic-orderbook" }
+atomic-strategy = { path = "crates/atomic-strategy" }
+atomic-router = { path = "crates/atomic-router" }
+atomic-risk = { path = "crates/atomic-risk" }
+atomic-execution = { path = "crates/atomic-execution" }
+atomic-replay = { path = "crates/atomic-replay" }
+atomic-transport = { path = "crates/atomic-transport" }
+atomic-hotpath = { path = "crates/atomic-hotpath" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Networking
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rcgen = "0.13"
+
+# Crypto
+ring = "0.17"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+rand = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP API / Dashboard
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Encoding
+hex = "0.4"
+
+# Data structures
+dashmap = "6"
+
+# Async traits
+async-trait = "0.1"
+
+# Benchmarking
+criterion = "0.5"

@@ -1,0 +1,28 @@
+[package]
+name = "atomic-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "atomic-node"
+path = "src/main.rs"
+
+[dependencies]
+atomic-core = { path = "../atomic-core" }
+atomic-bus = { path = "../atomic-bus" }
+atomic-feed = { path = "../atomic-feed" }
+atomic-orderbook = { path = "../atomic-orderbook" }
+atomic-strategy = { path = "../atomic-strategy" }
+atomic-router = { path = "../atomic-router" }
+atomic-risk = { path = "../atomic-risk" }
+atomic-execution = { path = "../atomic-execution" }
+atomic-replay = { path = "../atomic-replay" }
+atomic-transport = { path = "../atomic-transport" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
