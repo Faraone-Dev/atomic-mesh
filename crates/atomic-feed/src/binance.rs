@@ -1,23 +1,25 @@
 use crate::connector::{FeedConnector, RawFeedMessage};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443/ws";
+const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443/stream";
+const BINANCE_TESTNET_WS_URL: &str = "wss://stream.testnet.binance.vision/stream";
 
 /// Binance WebSocket feed connector.
 pub struct BinanceConnector {
     rx: mpsc::Receiver<RawFeedMessage>,
     tx: mpsc::Sender<RawFeedMessage>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    testnet: bool,
 }
 
 impl BinanceConnector {
-    pub fn new(buffer_size: usize) -> Self {
+    pub fn new(buffer_size: usize, testnet: bool) -> Self {
         let (tx, rx) = mpsc::channel(buffer_size);
-        Self { rx, tx, shutdown: None }
+        Self { rx, tx, shutdown: None, testnet }
     }
 }
 
@@ -29,58 +31,90 @@ impl FeedConnector for BinanceConnector {
             .iter()
             .flat_map(|s| {
                 let lower = s.to_lowercase();
-                vec![
-                    format!("{}@depth20@100ms", lower),
-                    format!("{}@trade", lower),
-                ]
+                if self.testnet {
+                    // Testnet supports fewer stream types
+                    vec![
+                        format!("{}@depth20", lower),
+                        format!("{}@trade", lower),
+                    ]
+                } else {
+                    vec![
+                        format!("{}@depth20@100ms", lower),
+                        format!("{}@trade", lower),
+                    ]
+                }
             })
             .collect();
 
-        let url = format!("{}/{}", BINANCE_WS_URL, streams.join("/"));
+        let base = if self.testnet { BINANCE_TESTNET_WS_URL } else { BINANCE_WS_URL };
+        // Use combined stream endpoint so messages include stream name wrapper
+        let url = format!("{}?streams={}", base, streams.join("/"));
+        info!("Binance WS URL: {}", url);
+        info!("Testnet mode: {}", self.testnet);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         self.shutdown = Some(shutdown_tx);
 
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
-            let ws_result = connect_async(&url).await;
-            let (_, mut read) = match ws_result {
-                Ok((ws, _)) => ((), ws),
-                Err(e) => {
-                    error!("Binance WS connection failed: {}", e);
-                    return;
-                }
-            };
-
-            info!("Binance WS connected: {} streams", streams.len());
+            let mut backoff_ms: u64 = 500;
+            const MAX_BACKOFF_MS: u64 = 30_000;
 
             loop {
-                tokio::select! {
-                    msg = read.next() => {
-                        match msg {
-                            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                                if let Some(feed_msg) = parse_binance_message(&text) {
-                                    if tx.send(feed_msg).await.is_err() {
-                                        break;
+                let ws_result = connect_async(&url).await;
+                let (_, mut read) = match ws_result {
+                    Ok((ws, _)) => {
+                        backoff_ms = 500; // reset on success
+                        ((), ws)
+                    }
+                    Err(e) => {
+                        error!("Binance WS connection failed: {} — URL: {} — retrying in {}ms", e, url, backoff_ms);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                        continue;
+                    }
+                };
+
+                info!("Binance WS connected: {} streams", streams.len());
+
+                let disconnected = loop {
+                    tokio::select! {
+                        msg = read.next() => {
+                            match msg {
+                                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                                    if let Some(feed_msg) = parse_binance_message(&text) {
+                                        if tx.send(feed_msg).await.is_err() {
+                                            break true; // channel closed, stop entirely
+                                        }
                                     }
                                 }
+                                Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_data))) => {
+                                    // Pong handled automatically by tungstenite
+                                }
+                                Some(Err(e)) => {
+                                    error!("Binance WS error: {} — reconnecting in {}ms", e, backoff_ms);
+                                    break false;
+                                }
+                                None => {
+                                    error!("Binance WS closed — reconnecting in {}ms", backoff_ms);
+                                    break false;
+                                }
+                                _ => {}
                             }
-                            Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_data))) => {
-                                // Pong handled automatically by tungstenite
-                            }
-                            Some(Err(e)) => {
-                                error!("Binance WS error: {}", e);
-                                break;
-                            }
-                            None => break,
-                            _ => {}
+                        }
+                        _ = &mut shutdown_rx => {
+                            info!("Binance WS shutting down");
+                            break true;
                         }
                     }
-                    _ = &mut shutdown_rx => {
-                        info!("Binance WS shutting down");
-                        break;
-                    }
+                };
+
+                if disconnected {
+                    break; // shutdown or channel closed
                 }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
             }
         });
 
@@ -106,6 +140,7 @@ impl FeedConnector for BinanceConnector {
 // --- Binance JSON parsing ---
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct BinanceDepth {
     #[serde(rename = "e")]
     event_type: Option<String>,
@@ -118,6 +153,7 @@ struct BinanceDepth {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct BinanceTrade {
     #[serde(rename = "e")]
     event_type: Option<String>,
@@ -139,6 +175,11 @@ struct BinanceCombined {
     data: serde_json::Value,
 }
 
+fn symbol_from_stream(stream: &str) -> Option<String> {
+    // "btcusdt@depth20" -> "BTCUSDT"
+    stream.split('@').next().map(|s| s.to_uppercase())
+}
+
 fn parse_binance_message(text: &str) -> Option<RawFeedMessage> {
     // Try combined stream format first
     if let Ok(combined) = serde_json::from_str::<BinanceCombined>(text) {
@@ -146,7 +187,8 @@ fn parse_binance_message(text: &str) -> Option<RawFeedMessage> {
         let data = &combined.data;
 
         if stream.contains("@depth") {
-            return parse_depth(data);
+            let sym = symbol_from_stream(stream)?;
+            return parse_depth(data, &sym);
         } else if stream.contains("@trade") {
             return parse_trade(data);
         }
@@ -154,20 +196,34 @@ fn parse_binance_message(text: &str) -> Option<RawFeedMessage> {
 
     // Try direct format
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        let event_type = value.get("e")?.as_str()?;
-        match event_type {
-            "depthUpdate" => return parse_depth(&value),
-            "trade" => return parse_trade(&value),
-            _ => {}
+        // depth20 partial book snapshot: has "lastUpdateId" but no "e" field
+        if value.get("lastUpdateId").is_some() && value.get("bids").is_some() {
+            return parse_depth(&value, "UNKNOWN");
+        }
+
+        if let Some(event_type) = value.get("e").and_then(|v| v.as_str()) {
+            match event_type {
+                "depthUpdate" => {
+                    let sym = value.get("s")?.as_str()?.to_string();
+                    return parse_depth(&value, &sym);
+                }
+                "trade" => return parse_trade(&value),
+                _ => {}
+            }
         }
     }
 
     None
 }
 
-fn parse_depth(data: &serde_json::Value) -> Option<RawFeedMessage> {
-    let symbol = data.get("s")?.as_str()?.to_string();
-    let timestamp = data.get("E")?.as_u64()?;
+fn parse_depth(data: &serde_json::Value, symbol: &str) -> Option<RawFeedMessage> {
+    // timestamp: use "E" if present (depthUpdate), otherwise use current time
+    let timestamp = data.get("E").and_then(|v| v.as_u64()).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    });
 
     let parse_levels = |key: &str| -> Vec<(f64, f64)> {
         data.get(key)
@@ -187,12 +243,24 @@ fn parse_depth(data: &serde_json::Value) -> Option<RawFeedMessage> {
     let bids = parse_levels("bids");
     let asks = parse_levels("asks");
 
-    Some(RawFeedMessage::OrderBookDelta {
-        symbol,
-        bids,
-        asks,
-        timestamp,
-    })
+    // depth20 is a full snapshot, depthUpdate is a delta
+    let is_snapshot = data.get("lastUpdateId").is_some() && data.get("e").is_none();
+
+    if is_snapshot {
+        Some(RawFeedMessage::OrderBookSnapshot {
+            symbol: symbol.to_string(),
+            bids,
+            asks,
+            timestamp,
+        })
+    } else {
+        Some(RawFeedMessage::OrderBookDelta {
+            symbol: symbol.to_string(),
+            bids,
+            asks,
+            timestamp,
+        })
+    }
 }
 
 fn parse_trade(data: &serde_json::Value) -> Option<RawFeedMessage> {

@@ -1,4 +1,3 @@
-use atomic_core::types::Symbol;
 use tokio::sync::mpsc;
 
 /// Raw market data message from an exchange WebSocket.

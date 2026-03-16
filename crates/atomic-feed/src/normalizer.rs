@@ -76,3 +76,108 @@ impl FeedNormalizer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomic_core::event::EventPayload;
+    use atomic_core::types::{Price, Qty, Venue};
+
+    #[test]
+    fn normalize_trade_converts_float_to_integer() {
+        let norm = FeedNormalizer::new(Venue::Binance, 2, 8);
+        let msg = RawFeedMessage::Trade {
+            symbol: "BTCUSDT".to_string(),
+            price: 50000.50,
+            qty: 0.123,
+            is_buy: true,
+            timestamp: 1000,
+        };
+        let payload = norm.normalize(msg).unwrap();
+        match payload {
+            EventPayload::Trade(t) => {
+                assert_eq!(t.price, Price::from_f64(50000.50, 2));
+                assert_eq!(t.qty, Qty::from_f64(0.123, 8));
+                assert_eq!(t.side, Side::Buy);
+                assert_eq!(t.symbol.base, "BTC");
+                assert_eq!(t.symbol.quote, "USDT");
+            }
+            _ => panic!("expected Trade"),
+        }
+    }
+
+    #[test]
+    fn normalize_snapshot_creates_book_update() {
+        let norm = FeedNormalizer::new(Venue::Binance, 2, 8);
+        let msg = RawFeedMessage::OrderBookSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            bids: vec![(3000.0, 10.0), (2999.0, 5.0)],
+            asks: vec![(3001.0, 8.0)],
+            timestamp: 2000,
+        };
+        let payload = norm.normalize(msg).unwrap();
+        match payload {
+            EventPayload::OrderBookUpdate(obu) => {
+                assert!(obu.is_snapshot);
+                assert_eq!(obu.bids.len(), 2);
+                assert_eq!(obu.asks.len(), 1);
+                assert_eq!(obu.symbol.base, "ETH");
+            }
+            _ => panic!("expected OrderBookUpdate"),
+        }
+    }
+
+    #[test]
+    fn normalize_delta_is_not_snapshot() {
+        let norm = FeedNormalizer::new(Venue::Binance, 2, 8);
+        let msg = RawFeedMessage::OrderBookDelta {
+            symbol: "BTCUSDT".to_string(),
+            bids: vec![(50000.0, 1.0)],
+            asks: vec![],
+            timestamp: 3000,
+        };
+        let payload = norm.normalize(msg).unwrap();
+        match payload {
+            EventPayload::OrderBookUpdate(obu) => {
+                assert!(!obu.is_snapshot);
+            }
+            _ => panic!("expected OrderBookUpdate"),
+        }
+    }
+
+    #[test]
+    fn parse_symbol_formats() {
+        let norm = FeedNormalizer::new(Venue::Binance, 2, 8);
+        let s1 = norm.parse_symbol("BTCUSDT");
+        assert_eq!(s1.base, "BTC");
+        assert_eq!(s1.quote, "USDT");
+
+        let s2 = norm.parse_symbol("BTC/USDT");
+        assert_eq!(s2.base, "BTC");
+        assert_eq!(s2.quote, "USDT");
+
+        let s3 = norm.parse_symbol("ETH-BTC");
+        assert_eq!(s3.base, "ETH");
+        assert_eq!(s3.quote, "BTC");
+
+        let s4 = norm.parse_symbol("SOLUSD");
+        assert_eq!(s4.base, "SOL");
+        assert_eq!(s4.quote, "USD");
+    }
+
+    #[test]
+    fn sell_side_from_is_buy_false() {
+        let norm = FeedNormalizer::new(Venue::Binance, 2, 8);
+        let msg = RawFeedMessage::Trade {
+            symbol: "BTCUSDT".to_string(),
+            price: 50000.0,
+            qty: 1.0,
+            is_buy: false,
+            timestamp: 0,
+        };
+        match norm.normalize(msg).unwrap() {
+            EventPayload::Trade(t) => assert_eq!(t.side, Side::Sell),
+            _ => panic!("expected Trade"),
+        }
+    }
+}

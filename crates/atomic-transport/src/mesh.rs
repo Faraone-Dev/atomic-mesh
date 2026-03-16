@@ -1,5 +1,5 @@
 use crate::protocol::MeshMessage;
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{Endpoint, ServerConfig};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 
 /// Peer connection tracking.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct Peer {
     addr: SocketAddr,
     node_id: [u8; 32],
@@ -17,6 +18,7 @@ struct Peer {
 /// QUIC-based mesh transport layer.
 /// Each node runs a QUIC server and connects to peers as a client.
 pub struct MeshTransport {
+    #[allow(dead_code)]
     node_id: [u8; 32],
     bind_addr: SocketAddr,
     endpoint: Option<Endpoint>,
@@ -52,7 +54,7 @@ impl MeshTransport {
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
                 let tx = incoming_tx.clone();
-                let peers = peers.clone();
+                let _peers = peers.clone();
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
