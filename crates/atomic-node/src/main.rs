@@ -233,10 +233,10 @@ async fn main() {
                 &strat_id,
                 symbol,
                 feed_cfg.venue,
-                100_000,      // order_qty = 0.001 BTC (~$73)
-                5_000_000,    // max_inventory = 0.05 BTC
-                5,            // half_spread = 5 pipettes ($0.05 fixed)
-                3000,         // gamma = 0.3 risk aversion
+                100_000,      // order_qty = 0.001 BTC (~$74)
+                20_000_000,   // max_inventory = 0.2 BTC
+                15,           // half_spread = 15 pipettes ($0.15)
+                1000,         // gamma = 0.1 risk aversion (aggressive)
             );
             strategy_engine.register(Box::new(mm));
         }
@@ -246,13 +246,13 @@ async fn main() {
 
     // C++ hot-path engine: same parameters as Rust MM but runs in ~100ns
     let mut hotpath = HotPathEngine::new(
-        100_000,       // order_qty = 0.001 BTC (~$73)
-        5_000_000,     // max_inventory = 0.05 BTC
-        0,             // half_spread = 0 → 1 pipette min ($0.01, at top of book)
-        3000,          // gamma = 0.3
+        100_000,       // order_qty = 0.001 BTC (~$74)
+        20_000_000,    // max_inventory = 0.2 BTC
+        10,            // half_spread = 10 pipettes ($0.10)
+        1000,          // gamma = 0.1 (aggressive)
         3,             // warmup_ticks
-        5,             // cooldown_ticks
-        500,           // requote_threshold = $5 (let orders sit longer)
+        2,             // cooldown_ticks (faster requote)
+        5,             // requote_threshold = $0.05 (requote on small moves)
     );
     info!("C++ hot-path engine initialized");
 
@@ -407,6 +407,11 @@ async fn main() {
         kill_action: std::sync::atomic::AtomicU8::new(0),
     });
     tokio::spawn(start_dashboard(cli.dashboard_port, dash_state));
+
+    // Auto-open dashboard in browser
+    let dash_url = format!("http://localhost:{}", cli.dashboard_port);
+    info!("Opening dashboard: {}", dash_url);
+    let _ = open::that(&dash_url);
 
     info!("Node is ready. Processing live events. Press Ctrl+C to shutdown.");
 

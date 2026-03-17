@@ -12,13 +12,13 @@
     }
   ],
   "risk": {
-    "max_position_qty": 100000000,
-    "max_notional": 500000000000,
-    "max_total_notional": 1000000000000,
-    "max_order_qty": 10000000,
-    "max_open_orders": 10,
-    "max_loss": -50000000,
-    "max_orders_per_second": 50
+    "max_position_qty": 200000000,
+    "max_notional": 2000000000000,
+    "max_total_notional": 5000000000000,
+    "max_order_qty": 50000000,
+    "max_open_orders": 20,
+    "max_loss": -200000000,
+    "max_orders_per_second": 100
   },
   "event_log_path": "data/events.log",
   "snapshot_interval": 10000,
