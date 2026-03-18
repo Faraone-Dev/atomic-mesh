@@ -115,10 +115,15 @@ extern "C" {
 
 // ── Safe Rust wrapper ─────────────────────────────────────────
 
+/// Max depth levels per side — must match C++ HP_MAX_LEVELS.
+const MAX_LEVELS: usize = 40;
+
 /// High-performance MM engine backed by C++ hot path.
 /// All compute happens in ~100-500ns per tick.
 pub struct HotPathEngine {
     ptr: *mut HpEngineOpaque,
+    bid_buf: [HpLevel; MAX_LEVELS],
+    ask_buf: [HpLevel; MAX_LEVELS],
 }
 
 // SAFETY: The C++ engine has no thread-local state and all
@@ -147,35 +152,38 @@ impl HotPathEngine {
             )
         };
         assert!(!ptr.is_null(), "Failed to create C++ hot-path engine");
-        Self { ptr }
+        Self {
+            ptr,
+            bid_buf: [HpLevel::default(); MAX_LEVELS],
+            ask_buf: [HpLevel::default(); MAX_LEVELS],
+        }
     }
 
     /// Process an order book update. Returns MM commands.
-    /// This is THE hot path — ~100-500ns.
+    /// This is THE hot path — zero-alloc, ~100-500ns.
     pub fn on_book_update(
         &mut self,
         bids: &[Level],
         asks: &[Level],
         is_snapshot: bool,
     ) -> HpResult {
-        // Convert Level slices to HpLevel arrays (zero-copy if layout matches,
-        // but Level has Price(i64)+Qty(u64) which is same as HpLevel)
-        let hp_bids: Vec<HpLevel> = bids
-            .iter()
-            .map(|l| HpLevel { price: l.price.0, qty: l.qty.0 })
-            .collect();
-        let hp_asks: Vec<HpLevel> = asks
-            .iter()
-            .map(|l| HpLevel { price: l.price.0, qty: l.qty.0 })
-            .collect();
+        let bid_count = bids.len().min(MAX_LEVELS);
+        let ask_count = asks.len().min(MAX_LEVELS);
+
+        for i in 0..bid_count {
+            self.bid_buf[i] = HpLevel { price: bids[i].price.0, qty: bids[i].qty.0 };
+        }
+        for i in 0..ask_count {
+            self.ask_buf[i] = HpLevel { price: asks[i].price.0, qty: asks[i].qty.0 };
+        }
 
         unsafe {
             hp_on_book_update(
                 self.ptr,
-                hp_bids.as_ptr(),
-                hp_bids.len() as i32,
-                hp_asks.as_ptr(),
-                hp_asks.len() as i32,
+                self.bid_buf.as_ptr(),
+                bid_count as i32,
+                self.ask_buf.as_ptr(),
+                ask_count as i32,
                 is_snapshot,
             )
         }
