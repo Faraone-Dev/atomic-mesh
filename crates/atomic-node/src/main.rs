@@ -253,6 +253,7 @@ async fn main() {
         3,             // warmup_ticks
         2,             // cooldown_ticks (faster requote)
         5,             // requote_threshold = $0.05 (requote on small moves)
+        !config.gateway.is_testnet(), // vpin_enabled: on in live, off on testnet (too few trades)
     );
     info!("C++ hot-path engine initialized");
 
@@ -300,21 +301,25 @@ async fn main() {
         // Start user data stream for fill notifications
         gw.start_user_data_stream().await;
 
-        // Seed MM with initial inventory via market buy (testnet: ensures both sides can quote)
-        let seed_sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
-        let seed_oid = OrderId("seed-buy-1".to_string());
-        gw.submit_order(
-            &seed_oid,
-            &seed_sym,
-            atomic_core::types::Side::Buy,
-            atomic_core::types::OrderType::Market,
-            atomic_core::types::Price(0), // price ignored for market orders
-            atomic_core::types::Qty(100_000), // 0.001 BTC
-            atomic_core::types::TimeInForce::GoodTilCancel,
-            0,
-            0,
-        ).await;
-        info!("Seed market buy sent for initial inventory");
+        // Seed MM with initial inventory via market buy (testnet only)
+        if config.gateway.is_testnet() {
+            let seed_sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
+            let seed_oid = OrderId("seed-buy-1".to_string());
+            gw.submit_order(
+                &seed_oid,
+                &seed_sym,
+                atomic_core::types::Side::Buy,
+                atomic_core::types::OrderType::Market,
+                atomic_core::types::Price(0), // price ignored for market orders
+                atomic_core::types::Qty(100_000), // 0.001 BTC
+                atomic_core::types::TimeInForce::GoodTilCancel,
+                0,
+                0,
+            ).await;
+            info!("Seed market buy sent for initial inventory (testnet)");
+        } else {
+            info!("Live mode — skipping seed market buy (manual inventory required)");
+        }
     }
 
     // Setup QUIC mesh transport
@@ -860,13 +865,13 @@ async fn main() {
                               volume_session,
                         );
 
-                        // Auto-reseed: when inventory drops to 0, market buy to refill
-                        if position_qty == 0 {
+                        // Auto-reseed: when inventory drops to 0, market buy to refill (testnet only)
+                        if position_qty == 0 && config.gateway.is_testnet() {
                             if let Some(ref gw) = gateway {
                                 let gw = Arc::clone(gw);
                                 let reseed_id = OrderId(format!("reseed-{}", last_seq));
                                 let sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
-                                info!("🔄 RESEED: inventory=0, sending market buy");
+                                info!("🔄 RESEED: inventory=0, sending market buy (testnet)");
                                 tokio::spawn(async move {
                                     gw.submit_order(
                                         &reseed_id,

@@ -31,8 +31,12 @@ struct alignas(HP_CACHELINE) ToxicityState {
     int64_t  last_price;
     int64_t  vol_ema;                   /* × 10000                   */
 
+    /* Runtime flag: if false, is_toxic()/spread_multiplier() are no-ops */
+    bool     enabled;
+
     ToxicityState() {
         std::memset(this, 0, sizeof(*this));
+        enabled = false;
     }
 
     void on_trade(int32_t side, uint64_t qty, int64_t price) {
@@ -80,11 +84,18 @@ struct alignas(HP_CACHELINE) ToxicityState {
     }
 
     bool is_toxic() const {
-        return false;  /* disabled for testnet — too few trades cause false VPIN spikes */
+        if (!enabled) return false;
+        return vpin() > TOXIC_THRESHOLD;
     }
 
-    /* Spread multiplier — disabled for testnet (always 1×) */
+    /* Spread multiplier: widen spread when toxic */
     int64_t spread_multiplier() const {
+        if (!enabled) return 10000;
+        int64_t v = vpin();
+        if (v > TOXIC_THRESHOLD) {
+            /* Scale: 1× at threshold, up to 2× at VPIN=10000 */
+            return 10000 + (v - TOXIC_THRESHOLD) * 10000 / (10000 - TOXIC_THRESHOLD);
+        }
         return 10000;
     }
 };

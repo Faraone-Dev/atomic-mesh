@@ -77,6 +77,7 @@ extern "C" {
         warmup_ticks: i32,
         cooldown_ticks: i32,
         requote_threshold: i64,
+        vpin_enabled: bool,
     ) -> *mut HpEngineOpaque;
 
     fn hp_engine_destroy(engine: *mut HpEngineOpaque);
@@ -139,6 +140,7 @@ impl HotPathEngine {
         warmup_ticks: i32,
         cooldown_ticks: i32,
         requote_threshold: i64,
+        vpin_enabled: bool,
     ) -> Self {
         let ptr = unsafe {
             hp_engine_create(
@@ -149,6 +151,7 @@ impl HotPathEngine {
                 warmup_ticks,
                 cooldown_ticks,
                 requote_threshold,
+                vpin_enabled,
             )
         };
         assert!(!ptr.is_null(), "Failed to create C++ hot-path engine");
@@ -258,14 +261,14 @@ mod tests {
 
     #[test]
     fn test_engine_create_destroy() {
-        let engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10);
+        let engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10, false);
         assert_eq!(engine.position(), 0);
         drop(engine);
     }
 
     #[test]
     fn test_book_update_generates_quotes() {
-        let mut engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10);
+        let mut engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10, false);
 
         let bids = make_levels(&[
             (7322300, 100_000_000),
@@ -292,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_trade_toxicity() {
-        let mut engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10);
+        let mut engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10, true);
 
         // Send many buy trades to build toxicity
         for i in 0..100 {
@@ -305,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_fill_updates_inventory() {
-        let mut engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10);
+        let mut engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10, false);
 
         engine.on_fill(Side::Buy, Qty(5_000_000), Price(7322300));
         assert_eq!(engine.position(), 5_000_000);
@@ -316,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_compute_time_under_microsecond() {
-        let mut engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10);
+        let mut engine = HotPathEngine::new(1_000_000, 10_000_000, 1, 3000, 3, 5, 10, false);
 
         let bids = make_levels(&[
             (7322300, 100_000_000),

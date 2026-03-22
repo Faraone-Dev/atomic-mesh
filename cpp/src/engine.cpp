@@ -58,6 +58,7 @@ struct hp_engine {
         int32_t  cooldown_ticks;
         int64_t  requote_threshold;
         int32_t  microprice_depth;
+        bool     vpin_enabled;
     } params;
 
     /* Mutable strategy state */
@@ -176,7 +177,8 @@ hp_engine_t* hp_engine_create(
     int32_t  gamma,
     int32_t  warmup_ticks,
     int32_t  cooldown_ticks,
-    int64_t  requote_threshold
+    int64_t  requote_threshold,
+    bool     vpin_enabled
 ) {
     auto* e = new hp_engine();
     e->params.order_qty          = order_qty;
@@ -185,8 +187,10 @@ hp_engine_t* hp_engine_create(
     e->params.cooldown_ticks     = cooldown_ticks;
     e->params.requote_threshold  = requote_threshold;
     e->params.microprice_depth   = 5;
+    e->params.vpin_enabled       = vpin_enabled;
     e->inventory.max_inventory   = max_inventory;
     e->inventory.gamma           = gamma;
+    e->toxicity.enabled          = vpin_enabled;
     return e;
 }
 

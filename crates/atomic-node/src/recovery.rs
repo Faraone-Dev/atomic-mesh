@@ -38,17 +38,23 @@ impl RecoveryCoordinator {
         &self.event_log_path
     }
 
-    /// Save a snapshot to disk.
+    /// Save a snapshot to disk (atomic: write temp + rename).
     pub fn save_snapshot(&self, snapshot: &EngineSnapshot) -> std::io::Result<()> {
         fs::create_dir_all(&self.snapshot_dir)?;
-        let filename = format!("{}/snapshot_{}.bin", self.snapshot_dir, snapshot.seq);
         let data = bincode::serialize(snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        fs::write(&filename, &data)?;
 
-        // Also write a "latest" symlink/copy
+        // Write numbered snapshot atomically: temp file + rename
+        let filename = format!("{}/snapshot_{}.bin", self.snapshot_dir, snapshot.seq);
+        let tmp_numbered = format!("{}.tmp", filename);
+        fs::write(&tmp_numbered, &data)?;
+        fs::rename(&tmp_numbered, &filename)?;
+
+        // Write "latest" pointer atomically: temp file + rename
         let latest = format!("{}/snapshot_latest.bin", self.snapshot_dir);
-        fs::write(&latest, &data)?;
+        let tmp_latest = format!("{}/snapshot_latest.bin.tmp", self.snapshot_dir);
+        fs::write(&tmp_latest, &data)?;
+        fs::rename(&tmp_latest, &latest)?;
 
         tracing::info!("Snapshot saved: seq={} hash={}", snapshot.seq, hex::encode(snapshot.state_hash));
         Ok(())

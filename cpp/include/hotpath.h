@@ -86,7 +86,8 @@ hp_engine_t* hp_engine_create(
     int32_t  gamma,
     int32_t  warmup_ticks,
     int32_t  cooldown_ticks,
-    int64_t  requote_threshold
+    int64_t  requote_threshold,
+    bool     vpin_enabled
 );
 
 void hp_engine_destroy(hp_engine_t* engine);
