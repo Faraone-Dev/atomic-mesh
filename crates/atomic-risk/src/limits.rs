@@ -20,6 +20,16 @@ pub struct RiskLimits {
     pub max_loss: i64,
     /// Maximum orders per second (rate limit).
     pub max_orders_per_second: u32,
+    /// Max spread (pipettes) to allow quoting. 0 = disabled.
+    #[serde(default)]
+    pub max_spread: i64,
+    /// Max consecutive losing round-trips before circuit breaker. 0 = disabled.
+    #[serde(default)]
+    pub max_consecutive_losses: u32,
+    /// Max drawdown from peak PnL as basis points (e.g. 200 = 2%). 0 = disabled.
+    /// Triggers soft pause (not kill switch) — auto-resumes on daily reset.
+    #[serde(default)]
+    pub max_drawdown_bps: u32,
 }
 
 impl Default for RiskLimits {
@@ -32,6 +42,9 @@ impl Default for RiskLimits {
             max_open_orders: 100,
             max_loss: -10_000_000_000,        // -10k USDT
             max_orders_per_second: 50,
+            max_spread: 5000,                 // $50 spread → don't quote (protects during flash crash)
+            max_consecutive_losses: 5,        // 5 losses in a row → circuit breaker
+            max_drawdown_bps: 200,            // 2% drawdown from peak → soft pause
         }
     }
 }
@@ -44,6 +57,14 @@ pub struct RiskEngine {
     open_order_count: usize,
     total_pnl: i64,
     order_timestamps: Vec<u64>,
+    /// Current spread in pipettes (updated by main loop on every book tick).
+    current_spread: i64,
+    /// Consecutive losing round-trips (reset on win or daily reset).
+    consecutive_losses: u32,
+    /// True if circuit breaker fired (consecutive losses or drawdown).
+    circuit_breaker: bool,
+    /// Peak PnL for drawdown tracking.
+    peak_pnl: i64,
 }
 
 impl RiskEngine {
@@ -54,6 +75,10 @@ impl RiskEngine {
             open_order_count: 0,
             total_pnl: 0,
             order_timestamps: Vec::new(),
+            current_spread: 0,
+            consecutive_losses: 0,
+            circuit_breaker: false,
+            peak_pnl: 0,
         }
     }
 
@@ -83,9 +108,24 @@ impl RiskEngine {
         position: Option<&Position>,
         current_ts: u64,
     ) -> Result<()> {
-        // Kill switch check
+        // Kill switch check (hard — only manual reset)
         if self.is_killed() {
             return Err(AtomicError::KillSwitch("kill switch is active".into()));
+        }
+
+        // Circuit breaker check (soft — auto-resets on daily_reset)
+        if self.circuit_breaker {
+            return Err(AtomicError::RiskLimitExceeded(
+                "circuit breaker active (consecutive losses or drawdown)".into(),
+            ));
+        }
+
+        // Spread gate: don't quote into a wide spread (adverse selection protection)
+        if self.limits.max_spread > 0 && self.current_spread > self.limits.max_spread {
+            return Err(AtomicError::RiskLimitExceeded(format!(
+                "spread {} exceeds max {} — skipping quote",
+                self.current_spread, self.limits.max_spread
+            )));
         }
 
         // Max order size
@@ -139,7 +179,7 @@ impl RiskEngine {
             ));
         }
 
-        // Loss limit
+        // Loss limit (hard kill switch)
         if self.total_pnl < self.limits.max_loss {
             self.activate_kill_switch(&format!(
                 "total PnL {} below max loss {}",
@@ -162,6 +202,59 @@ impl RiskEngine {
 
     pub fn update_pnl(&mut self, pnl_delta: i64) {
         self.total_pnl += pnl_delta;
+
+        // Track peak for drawdown calculation
+        if self.total_pnl > self.peak_pnl {
+            self.peak_pnl = self.total_pnl;
+        }
+
+        // Drawdown circuit breaker: (peak - current) / peak > max_drawdown_bps/10000
+        // Using integer math to avoid float: (peak - current) * 10000 > peak * max_drawdown_bps
+        if self.limits.max_drawdown_bps > 0 && self.peak_pnl > 0 {
+            let drawdown = self.peak_pnl - self.total_pnl;
+            if drawdown * 10_000 > self.peak_pnl * self.limits.max_drawdown_bps as i64 {
+                self.circuit_breaker = true;
+                tracing::warn!(
+                    "CIRCUIT BREAKER: drawdown {}bps from peak (limit: {}bps) — pausing",
+                    drawdown * 10_000 / self.peak_pnl,
+                    self.limits.max_drawdown_bps
+                );
+            }
+        }
+    }
+
+    /// Record a winning round-trip. Resets consecutive loss counter.
+    pub fn record_win(&mut self) {
+        self.consecutive_losses = 0;
+    }
+
+    /// Record a losing round-trip. If max breached → circuit breaker.
+    pub fn record_loss(&mut self) {
+        self.consecutive_losses += 1;
+        if self.limits.max_consecutive_losses > 0
+            && self.consecutive_losses >= self.limits.max_consecutive_losses
+        {
+            self.circuit_breaker = true;
+            tracing::warn!(
+                "CIRCUIT BREAKER: {} consecutive losses (limit: {}) — pausing",
+                self.consecutive_losses, self.limits.max_consecutive_losses
+            );
+        }
+    }
+
+    /// Update the current spread (called on every book update from main loop).
+    pub fn update_spread(&mut self, spread: i64) {
+        self.current_spread = spread;
+    }
+
+    /// Daily reset: clears circuit breaker, consecutive losses, and PnL peak.
+    /// Call at UTC midnight or session start.
+    pub fn daily_reset(&mut self) {
+        self.circuit_breaker = false;
+        self.consecutive_losses = 0;
+        self.peak_pnl = self.total_pnl; // new session starts from current PnL
+        self.total_pnl = 0;
+        tracing::info!("Risk daily reset: circuit breaker cleared, PnL zeroed");
     }
 
     pub fn total_pnl(&self) -> i64 {
@@ -170,6 +263,18 @@ impl RiskEngine {
 
     pub fn open_order_count(&self) -> usize {
         self.open_order_count
+    }
+
+    pub fn is_circuit_breaker(&self) -> bool {
+        self.circuit_breaker
+    }
+
+    pub fn consecutive_losses(&self) -> u32 {
+        self.consecutive_losses
+    }
+
+    pub fn peak_pnl(&self) -> i64 {
+        self.peak_pnl
     }
 }
 

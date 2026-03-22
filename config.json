@@ -18,7 +18,10 @@
     "max_order_qty": 50000000,
     "max_open_orders": 20,
     "max_loss": -200000000,
-    "max_orders_per_second": 100
+    "max_orders_per_second": 100,
+    "max_spread": 5000,
+    "max_consecutive_losses": 5,
+    "max_drawdown_bps": 200
   },
   "event_log_path": "data/events.log",
   "snapshot_interval": 10000,
