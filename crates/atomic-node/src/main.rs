@@ -58,6 +58,10 @@ struct Cli {
     /// Print metrics report at end of replay/backtest
     #[arg(long)]
     metrics: bool,
+
+    /// Export backtest equity curve to CSV file
+    #[arg(long)]
+    equity_csv: Option<String>,
 }
 
 #[tokio::main]
@@ -192,7 +196,7 @@ async fn main() {
     // === BACKTEST MODE ===
     if let Some(backtest_path) = cli.backtest {
         info!("BACKTEST MODE: reading from {}", backtest_path);
-        run_backtest(&backtest_path, &mut execution, &mut strategy_engine, &mut verifier, &metrics);
+        run_backtest(&backtest_path, &mut execution, &mut verifier, &metrics, &config, cli.equity_csv.as_deref());
 
         if cli.metrics {
             println!("\n{}", metrics.report());
@@ -443,6 +447,7 @@ async fn main() {
     let mut last_rate_check = std::time::Instant::now();
     let mut events_per_sec: f64 = 0.0;
     let mut volume_session: f64 = 0.0;
+    let mut last_reset_day: u64 = wall_clock.now_nanos() / 86_400_000_000_000; // UTC day number
 
     // Persistent order books keyed by symbol pair (e.g. "BTC/USDT")
     let mut books: HashMap<String, OrderBook> = HashMap::new();
@@ -454,6 +459,7 @@ async fn main() {
     let mut position_qty: i64 = 0;      // in raw qty units (satoshis)
     let mut cost_basis: i64 = 0;         // total cost in pipettes (price * qty / qty_divisor)
     let mut realized_pnl: i64 = 0;       // cumulative realized PnL in pipettes
+    let mut last_flat_pnl: i64 = 0;      // PnL snapshot at last flat position (for round-trip tracking)
 
     loop {
         tokio::select! {
@@ -486,6 +492,11 @@ async fn main() {
                     }
                     strategy_engine.update_book(key.clone(), book.clone());
                     router.update_book(&key, obu.symbol.venue, book.clone());
+
+                    // Feed spread to risk engine for spread gate
+                    if let Some(spread) = book.spread() {
+                        risk.update_spread(spread);
+                    }
 
                     // Always update live price for topbar
                     if let Some(mid) = book.mid_price() {
@@ -849,6 +860,17 @@ async fn main() {
                         realized_pnl -= fee_cost;
                         risk.update_pnl(realized_pnl - risk.total_pnl());
 
+                        // Round-trip tracking for consecutive loss circuit breaker
+                        if position_qty == 0 {
+                            let trade_pnl = realized_pnl - last_flat_pnl;
+                            if trade_pnl >= 0 {
+                                risk.record_win();
+                            } else {
+                                risk.record_loss();
+                            }
+                            last_flat_pnl = realized_pnl;
+                        }
+
                         // Convert to human-readable dollars for dashboard
                         let pnl_usd = risk.total_pnl() as f64 / price_divisor;
                         let vol_usd = fill_value as f64 / price_divisor;
@@ -972,6 +994,17 @@ async fn main() {
                 };
                 mesh.broadcast(&heartbeat).await;
 
+                // Daily risk reset at UTC midnight
+                let current_day = wall_clock.now_nanos() / 86_400_000_000_000;
+                if current_day > last_reset_day {
+                    last_reset_day = current_day;
+                    risk.daily_reset();
+                    volume_session = 0.0;
+                    last_flat_pnl = 0;
+                    realized_pnl = 0;
+                    cost_basis = 0;
+                }
+
                 // Push dashboard tick
                 let rate_elapsed = last_rate_check.elapsed().as_secs_f64();
                 if rate_elapsed >= 1.0 {
@@ -1003,6 +1036,9 @@ async fn main() {
                 });
 
                 // Push Risk state on heartbeat
+                let drawdown_pct = if risk.peak_pnl() > 0 {
+                    (risk.peak_pnl() - risk.total_pnl()) as f64 / risk.peak_pnl() as f64 * 100.0
+                } else { 0.0 };
                 let _ = dash_tx.send(DashboardEvent::Risk {
                     open_orders: risk.open_order_count() as u64,
                     max_open: config.risk.max_open_orders as u64,
@@ -1010,8 +1046,8 @@ async fn main() {
                     max_daily_loss: format!("{:.2}", config.risk.max_loss as f64 / price_divisor),
                     exposure: "0.00".to_string(),
                     max_exposure: format!("{:.2}", config.risk.max_notional as f64 / price_divisor),
-                    drawdown_pct: "0.00".to_string(),
-                    max_drawdown_pct: "0.00".to_string(),
+                    drawdown_pct: format!("{:.2}", drawdown_pct),
+                    max_drawdown_pct: format!("{:.2}", config.risk.max_drawdown_bps as f64 / 100.0),
                 });
 
                 // Push Strategy info on heartbeat
@@ -1154,13 +1190,15 @@ fn run_replay(
     info!("Final state hash: {}", hex::encode(execution.state_hash()));
 }
 
-/// Backtest mode: replay market data through a simulated exchange.
+/// Backtest mode: replay market data through C++ hot-path engine + simulated exchange.
+/// Produces PnL tracking, equity curve, and a full performance report.
 fn run_backtest(
     path: &str,
     execution: &mut ExecutionEngine,
-    strategy_engine: &mut StrategyEngine,
     verifier: &mut StateVerifier,
     metrics: &PipelineMetrics,
+    config: &NodeConfig,
+    equity_csv: Option<&str>,
 ) {
     let mut player = match atomic_replay::ReplayPlayer::from_file(path) {
         Ok(p) => p,
@@ -1172,57 +1210,187 @@ fn run_backtest(
 
     info!("Loaded {} events for backtest", player.total_events());
 
+    // Decimal precision from config
+    let price_decimals: u8 = config.feeds.first().map(|f| f.price_decimals).unwrap_or(2);
+    let qty_decimals: u8 = config.feeds.first().map(|f| f.qty_decimals).unwrap_or(8);
+    let qty_divisor = 10i64.pow(qty_decimals as u32);
+    let price_divisor = 10f64.powi(price_decimals as i32);
+
+    // C++ hot-path engine (same params as live mode, VPIN enabled for backtest)
+    let mut hotpath = HotPathEngine::new(
+        100_000,       // order_qty = 0.001 BTC
+        20_000_000,    // max_inventory = 0.2 BTC
+        10,            // half_spread = 10 pipettes ($0.10)
+        1000,          // gamma = 0.1
+        3,             // warmup_ticks
+        2,             // cooldown_ticks
+        5,             // requote_threshold
+        true,          // vpin_enabled: always on in backtest (enough trade data)
+    );
+    info!("C++ hot-path engine initialized for backtest");
+
     let mut sim = SimulatedExchange::new(SimulatorConfig::default());
     let mut processed = 0u64;
     let source = [0u8; 32];
     let replay_start = std::time::Instant::now();
 
+    // PnL tracking (mirrors live mode logic)
+    let mut position_qty: i64 = 0;
+    let mut cost_basis: i64 = 0;
+    let mut realized_pnl: i64 = 0;
+    let mut total_trades: u64 = 0;
+    let mut winning_trades: u64 = 0;
+    let mut peak_pnl: i64 = 0;
+    let mut max_drawdown: i64 = 0;
+    let mut volume_total: f64 = 0.0;
+
+    // Equity curve: (event_seq, realized_pnl_pipettes, position_qty)
+    let mut equity_curve: Vec<(u64, i64, i64)> = Vec::new();
+
+    // Per-trade tracking for win/loss
+    let mut trade_pnls: Vec<f64> = Vec::new();
+    let mut last_flat_pnl: i64 = 0; // PnL at last time position went flat
+
+    let sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
+
     while let Some(event) = player.next() {
         // Feed market data to simulator
-        match &event.payload {
-            EventPayload::OrderBookUpdate(obu) => {
-                sim.on_book_update(&obu.symbol, &obu.bids, &obu.asks, obu.is_snapshot);
-            }
-            _ => {}
+        if let EventPayload::OrderBookUpdate(ref obu) = event.payload {
+            sim.on_book_update(&obu.symbol, &obu.bids, &obu.asks, obu.is_snapshot);
         }
 
-        // Process through strategy engine → get commands
-        let commands = strategy_engine.process_event(event);
+        // Route event through C++ hot-path engine
+        let hp_result = match &event.payload {
+            EventPayload::OrderBookUpdate(obu) => {
+                hotpath.on_book_update(&obu.bids, &obu.asks, obu.is_snapshot)
+            }
+            EventPayload::Trade(t) => {
+                hotpath.on_trade(t.side, t.price, t.qty)
+            }
+            _ => atomic_hotpath::HpResult::default(),
+        };
 
-        // Execute strategy commands via simulated exchange
-        for cmd in commands {
-            match cmd {
-                atomic_strategy::StrategyCommand::PlaceOrder {
-                    symbol, side, order_type, price, qty, time_in_force, venue: _,
-                } => {
-                    let order_id = execution.next_order_id(atomic_core::types::Venue::Simulated);
+        // Convert C++ hot-path commands to strategy commands → submit to sim
+        for i in 0..hp_result.count {
+            let cmd = &hp_result.commands[i as usize];
+            match cmd.tag {
+                1 => { // HP_CMD_PLACE_BID
+                    let order_id = execution.next_order_id(Venue::Simulated);
                     let order_new = atomic_core::event::OrderNewEvent {
                         order_id,
-                        symbol,
-                        side,
-                        order_type,
-                        price,
-                        qty,
-                        time_in_force,
-                        venue: atomic_core::types::Venue::Simulated,
+                        symbol: sym.clone(),
+                        side: atomic_core::types::Side::Buy,
+                        order_type: atomic_core::types::OrderType::Limit,
+                        price: atomic_core::types::Price(cmd.price),
+                        qty: atomic_core::types::Qty(cmd.qty),
+                        time_in_force: atomic_core::types::TimeInForce::GoodTilCancel,
+                        venue: Venue::Simulated,
                     };
                     sim.submit_order(&order_new, event.timestamp, source);
                     metrics.total_orders.fetch_add(1, Ordering::Relaxed);
                 }
-                atomic_strategy::StrategyCommand::CancelOrder { order_id } => {
-                    sim.cancel_order(&order_id, event.timestamp, source);
+                2 => { // HP_CMD_PLACE_ASK
+                    let order_id = execution.next_order_id(Venue::Simulated);
+                    let order_new = atomic_core::event::OrderNewEvent {
+                        order_id,
+                        symbol: sym.clone(),
+                        side: atomic_core::types::Side::Sell,
+                        order_type: atomic_core::types::OrderType::Limit,
+                        price: atomic_core::types::Price(cmd.price),
+                        qty: atomic_core::types::Qty(cmd.qty),
+                        time_in_force: atomic_core::types::TimeInForce::GoodTilCancel,
+                        venue: Venue::Simulated,
+                    };
+                    sim.submit_order(&order_new, event.timestamp, source);
+                    metrics.total_orders.fetch_add(1, Ordering::Relaxed);
                 }
-                atomic_strategy::StrategyCommand::CancelAll { .. } => {}
+                3 => { // HP_CMD_CANCEL_ALL
+                    let open_ids = execution.open_order_ids();
+                    for oid in &open_ids {
+                        sim.cancel_order(oid, event.timestamp, source);
+                    }
+                }
+                _ => {}
             }
         }
 
-        // Process simulated exchange events through execution engine
-        let sim_events = sim.drain_events(event.seq * 1000); // offset to avoid seq collision
+        // Drain simulated exchange events → process fills
+        let sim_events = sim.drain_events(event.seq * 1000);
         for sim_event in &sim_events {
             let _ = execution.process_event(sim_event);
+
             match &sim_event.payload {
-                EventPayload::OrderFill(_) | EventPayload::OrderPartialFill(_) => {
+                EventPayload::OrderFill(fill) | EventPayload::OrderPartialFill(fill) => {
                     metrics.total_fills.fetch_add(1, Ordering::Relaxed);
+
+                    // Feed fill back to C++ engine for inventory tracking
+                    hotpath.on_fill(fill.side, fill.qty, fill.price);
+
+                    // PnL computation (same logic as live mode)
+                    let fill_value = (fill.price.0 as i64) * (fill.qty.0 as i64) / qty_divisor;
+                    let fill_qty = fill.qty.0 as i64;
+
+                    match fill.side {
+                        atomic_core::types::Side::Buy => {
+                            if position_qty >= 0 {
+                                position_qty += fill_qty;
+                                cost_basis += fill_value;
+                            } else {
+                                let close_qty = fill_qty.min(-position_qty);
+                                let avg_entry = cost_basis as f64 / position_qty as f64;
+                                let close_value = (avg_entry * close_qty as f64) as i64;
+                                realized_pnl += close_value - (fill.price.0 as i64) * close_qty / qty_divisor;
+                                position_qty += fill_qty;
+                                cost_basis += (fill.price.0 as i64) * close_qty / qty_divisor;
+                                let open_qty = fill_qty - close_qty;
+                                if open_qty > 0 {
+                                    cost_basis = (fill.price.0 as i64) * open_qty / qty_divisor;
+                                }
+                            }
+                        }
+                        atomic_core::types::Side::Sell => {
+                            if position_qty <= 0 {
+                                position_qty -= fill_qty;
+                                cost_basis -= fill_value;
+                            } else {
+                                let close_qty = fill_qty.min(position_qty);
+                                let avg_entry = cost_basis as f64 / position_qty as f64;
+                                let entry_value = (avg_entry * close_qty as f64) as i64;
+                                realized_pnl += (fill.price.0 as i64) * close_qty / qty_divisor - entry_value;
+                                position_qty -= fill_qty;
+                                cost_basis -= entry_value;
+                                let open_qty = fill_qty - close_qty;
+                                if open_qty > 0 {
+                                    cost_basis = -((fill.price.0 as i64) * open_qty / qty_divisor);
+                                }
+                            }
+                        }
+                    }
+                    realized_pnl -= fill.fee;
+                    volume_total += (fill_value as f64 / price_divisor).abs();
+
+                    // Track round-trip trades when position goes flat
+                    if position_qty == 0 {
+                        let trade_pnl = realized_pnl - last_flat_pnl;
+                        trade_pnls.push(trade_pnl as f64 / price_divisor);
+                        total_trades += 1;
+                        if trade_pnl > 0 {
+                            winning_trades += 1;
+                        }
+                        last_flat_pnl = realized_pnl;
+                    }
+
+                    // Drawdown tracking
+                    if realized_pnl > peak_pnl {
+                        peak_pnl = realized_pnl;
+                    }
+                    let dd = peak_pnl - realized_pnl;
+                    if dd > max_drawdown {
+                        max_drawdown = dd;
+                    }
+
+                    // Record equity point on every fill
+                    equity_curve.push((event.seq, realized_pnl, position_qty));
                 }
                 _ => {}
             }
@@ -1238,25 +1406,78 @@ fn run_backtest(
 
         if processed % 100_000 == 0 {
             info!(
-                "Backtest {}/{} ({:.1}%) — orders: {} fills: {} resting: {}",
+                "Backtest {}/{} ({:.1}%) — orders: {} fills: {} resting: {} PnL: ${:.4}",
                 processed,
                 player.total_events(),
                 player.progress_pct(),
                 metrics.total_orders.load(Ordering::Relaxed),
                 metrics.total_fills.load(Ordering::Relaxed),
                 sim.resting_order_count(),
+                realized_pnl as f64 / price_divisor,
             );
         }
     }
 
     let elapsed = replay_start.elapsed();
-    info!(
-        "Backtest complete: {} events in {:.2}s — orders: {} fills: {}",
-        processed, elapsed.as_secs_f64(),
-        metrics.total_orders.load(Ordering::Relaxed),
-        metrics.total_fills.load(Ordering::Relaxed),
-    );
-    info!("Final state hash: {}", hex::encode(execution.state_hash()));
+    let total_fills = metrics.total_fills.load(Ordering::Relaxed);
+    let total_orders = metrics.total_orders.load(Ordering::Relaxed);
+    let pnl_usd = realized_pnl as f64 / price_divisor;
+    let dd_usd = max_drawdown as f64 / price_divisor;
+    let eps = if elapsed.as_secs_f64() > 0.0 { processed as f64 / elapsed.as_secs_f64() } else { 0.0 };
+
+    // Compute Sharpe ratio from round-trip trade PnLs
+    let (avg_trade, sharpe) = if trade_pnls.len() >= 2 {
+        let mean = trade_pnls.iter().sum::<f64>() / trade_pnls.len() as f64;
+        let variance = trade_pnls.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (trade_pnls.len() - 1) as f64;
+        let std_dev = variance.sqrt();
+        let s = if std_dev > 0.0 { mean / std_dev } else { 0.0 };
+        (mean, s)
+    } else {
+        (pnl_usd, 0.0)
+    };
+
+    let win_rate = if total_trades > 0 { winning_trades as f64 / total_trades as f64 * 100.0 } else { 0.0 };
+
+    // Export equity curve CSV
+    if let Some(csv_path) = equity_csv {
+        match std::fs::File::create(csv_path) {
+            Ok(file) => {
+                use std::io::Write;
+                let mut w = std::io::BufWriter::new(file);
+                let _ = writeln!(w, "seq,realized_pnl_usd,position_qty");
+                for (seq, pnl, pos) in &equity_curve {
+                    let _ = writeln!(w, "{},{:.6},{}", seq, *pnl as f64 / price_divisor, pos);
+                }
+                info!("Equity curve exported to {}", csv_path);
+            }
+            Err(e) => {
+                error!("Failed to write equity CSV: {}", e);
+            }
+        }
+    }
+
+    // Print comprehensive report
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║              ATOMIC MESH — BACKTEST REPORT              ║");
+    println!("╠══════════════════════════════════════════════════════════╣");
+    println!("║  Engine          : C++ HotPath (Avellaneda-Stoikov)     ║");
+    println!("║  Events          : {:>10} ({:.0} evt/s){:>15}║", processed, eps, "");
+    println!("║  Duration        : {:.2}s{:>36}║", elapsed.as_secs_f64(), "");
+    println!("╠══════════════════════════════════════════════════════════╣");
+    println!("║  Orders          : {:>10}{:>28}║", total_orders, "");
+    println!("║  Fills           : {:>10}{:>28}║", total_fills, "");
+    println!("║  Round-trips     : {:>10}{:>28}║", total_trades, "");
+    println!("║  Volume          : ${:>12.2}{:>24}║", volume_total, "");
+    println!("╠══════════════════════════════════════════════════════════╣");
+    println!("║  Realized PnL    : ${:>12.4}{:>24}║", pnl_usd, "");
+    println!("║  Max Drawdown    : ${:>12.4}{:>24}║", dd_usd, "");
+    println!("║  Win Rate        : {:>11.1}%{:>25}║", win_rate, "");
+    println!("║  Avg Trade PnL   : ${:>12.6}{:>24}║", avg_trade, "");
+    println!("║  Sharpe (trade)  : {:>12.3}{:>25}║", sharpe, "");
+    println!("║  Final Position  : {:>10}{:>28}║", position_qty, "");
+    println!("╠══════════════════════════════════════════════════════════╣");
+    println!("║  State Hash      : {}  ║", hex::encode(execution.state_hash()));
+    println!("╚══════════════════════════════════════════════════════════╝\n");
 }
 
 /// Handle incoming mesh messages from peer nodes.

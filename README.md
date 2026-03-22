@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.80+-f74c00?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![C++17](https://img.shields.io/badge/C++-17-00599C?style=flat-square&logo=cplusplus)](https://isocpp.org)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-46_passing-brightgreen?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-79_passing-brightgreen?style=flat-square)]()
 [![Latency](https://img.shields.io/badge/Strategy_Compute-575ns-ff6b6b?style=flat-square)]()
 
 *A multi-node, event-sourced trading engine with sub-microsecond strategy execution.*
@@ -124,6 +124,49 @@ On **book update**: recompute microprice, requote if fair value moved beyond thr
 
 ---
 
+## Pre-Trade Risk Gate
+
+Three-tier risk hierarchy designed for market-making — rejects toxic orders before they leave the node:
+
+### Tier 1 — Per-Order Gate (microsecond)
+
+Every order passes through `check_order()` before routing to execution:
+
+| Check | What it does |
+|---|---|
+| **Spread gate** | Rejects quoting when `spread > max_spread`. Protects against adverse selection during flash crashes, halts, and illiquid conditions. Fed by live book spread on every tick. |
+| **Max order qty** | Single order cannot exceed configured size |
+| **Position limit** | Resulting position cannot exceed `max_position_qty` |
+| **Notional cap** | Exposure cannot exceed `max_notional` per symbol |
+| **Open orders** | Cannot exceed `max_open_orders` simultaneously |
+| **Rate limiter** | Max `max_orders_per_second` to avoid exchange bans |
+
+### Tier 2 — Circuit Breaker (soft pause)
+
+Automatically pauses quoting on adverse patterns. Resets at UTC midnight via `daily_reset()`:
+
+| Trigger | Behavior |
+|---|---|
+| **Consecutive losses** | After N losing round-trips in a row → circuit breaker fires. A round-trip = position goes flat. Resets on first winning trade or daily reset. |
+| **Drawdown from peak** | When `(peak_pnl − current_pnl) / peak_pnl > max_drawdown_bps` → soft pause. Prevents giving back a winning session. |
+
+### Tier 3 — Kill Switch (hard stop)
+
+Global atomic boolean. Once fired, **all orders are rejected** until manual `reset_kill_switch()`:
+
+- Triggers when `total_pnl < max_loss` (absolute loss limit)
+- Only human override can restart — not automated
+
+### Daily Reset
+
+On UTC midnight (detected via heartbeat tick every 5s):
+- Circuit breaker cleared
+- Consecutive losses reset
+- PnL, volume, cost basis zeroed
+- New trading session starts clean
+
+---
+
 ## C++ Hot-Path (FFI)
 
 The performance-critical path — orderbook maintenance, microprice, signal computation, and quote generation — is implemented in C++17 and called via FFI through Rust's `cc` crate. Compiled with `-O3 -march=native` for native SIMD and branch prediction optimization.
@@ -168,11 +211,11 @@ atomic-mesh/
 ├── atomic-strategy      Avellaneda-Stoikov MM: microprice, inventory, VPIN toxicity
 ├── atomic-hotpath       C++17 FFI hot-path: orderbook, signals, quote generation (575ns)
 ├── atomic-router        Smart Order Router: BestVenue, VWAP, TWAP, LiquiditySweep
-├── atomic-risk          Position limits, max order size, rate limits, kill switch
+├── atomic-risk          Pre-trade risk gate: spread, position, drawdown, circuit breaker, kill switch
 ├── atomic-execution     Order state machine, simulated exchange, state hash, snapshot
 ├── atomic-replay        Deterministic replay, seek, batch, idempotency verification
 ├── atomic-transport     QUIC encrypted inter-node mesh (event replication, consensus)
-└── atomic-node          CLI entry, config, WebSocket dashboard, recovery coordinator, backtest
+└── atomic-node          CLI entry, config, WebSocket dashboard, recovery coordinator, C++ backtest
 ```
 
 **12 crates** — each with a single responsibility, no circular dependencies.
@@ -188,14 +231,18 @@ Replay processes events through the full execution engine — not just strategy.
 - `replay_determinism_same_events_same_hash` — replay the same events twice, get identical state hash
 - `replay_snapshot_restore_same_hash` — snapshot, restore, get identical state hash
 
-### Exchange Simulator
+### Exchange Simulator & C++ Backtester
 
-Full matching engine for backtesting without live connections:
+Full matching engine with the production C++ hot-path engine for realistic backtesting:
 
 - Market orders walk the book and consume liquidity
 - Limit orders cross or rest; resting orders fill on book updates
 - Configurable maker/taker fees (basis points) and latency (nanoseconds)
-- Backtest mode: `--backtest events.log` replays market data through simulator
+- **C++ hot-path in the loop** — backtest uses the same `HotPathEngine` as live trading, not the Rust strategy engine. Same Avellaneda-Stoikov logic, same parameters, same 575ns compute
+- **PnL tracking** — average cost basis, realized PnL per fill, round-trip trade detection
+- **Equity curve export** — `--equity-csv results.csv` exports `(seq, realized_pnl_usd, position_qty)` per fill
+- **Performance report** — total trades, win rate, max drawdown, Sharpe ratio (per round-trip), avg trade PnL, volume
+- Backtest mode: `--backtest data/events.log --equity-csv equity.csv --metrics`
 
 ### Latency Observability
 
@@ -244,8 +291,11 @@ cargo run --release
 
 # Dashboard available at http://localhost:3000
 
-# Backtest mode (simulated exchange)
+# Backtest mode (C++ hot-path + simulated exchange)
 cargo run --release -- --backtest data/events.log --metrics
+
+# Backtest with equity curve export
+cargo run --release -- --backtest data/events.log --equity-csv results.csv --metrics
 
 # Run all tests (46 tests across 7 crates)
 cargo test
@@ -260,12 +310,16 @@ cargo test
 | `atomic-bus` | 3 | SPSC ring buffer: push, pop, wrap-around, full buffer |
 | `atomic-core` | 4 | Histogram record/percentile, StageTimer RAII, PipelineMetrics report |
 | `atomic-execution` | 11 | Order lifecycle, state transitions, market/limit fills, cancel, IOC, FOK |
+| `atomic-feed` | 5 | Feed normalization, snapshot/delta, trade parsing, symbol formats |
 | `atomic-hotpath` | 5 | C++ FFI: book update, trade, fill, quote generation, requote threshold |
 | `atomic-node` | 2 | Event deduplicator, recovery cold start |
 | `atomic-orderbook` | 3 | Book snapshot, delta update, simulated fill |
 | `atomic-replay` | 2 | Deterministic replay hash, snapshot restore hash |
+| `atomic-risk` | 10 | Kill switch, rate limit, position limit, order qty, PnL tracking, reset |
+| `atomic-router` | 6 | BestVenue buy/sell, VWAP split, TWAP split, liquidity sweep, empty book |
 | `atomic-strategy` | 21 | Microprice (5), inventory (7), VPIN toxicity (5), A-S market maker (4) |
-| **Total** | **51** | |
+| `atomic-transport` | 7 | Wire protocol roundtrip: heartbeat, replication, batch, sync, consensus, hash |
+| **Total** | **79** | |
 
 ---
 
