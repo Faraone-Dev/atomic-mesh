@@ -132,28 +132,26 @@ static hp_result_t generate_quotes(hp_engine* e, int64_t fair_value) {
         result.count++;
     }
 
-    /* Bid = FV + hs (cross spread to fill as taker on testnet) */
-    int64_t bid_price = fair_value + half_spread;
-    /* Ask = FV - hs (cross spread to fill as taker on testnet) */
-    int64_t ask_price = fair_value - half_spread;
+    /* Maker-mode: passive quotes outside the fair value */
+    /* Bid = FV − hs − skew (below mid, passive buy) */
+    int64_t bid_price = fair_value - half_spread - skew;
+    /* Ask = FV + hs − skew (above mid, passive sell) */
+    int64_t ask_price = fair_value + half_spread - skew;
 
-    /* Place bid (skip if at max inventory) */
-    if (!e->inventory.at_max()) {
+    /* Place bid (skip if at max long inventory) */
+    if (!e->inventory.at_max_long()) {
         result.commands[result.count].tag   = HP_CMD_PLACE_BID;
         result.commands[result.count].price = bid_price;
         result.commands[result.count].qty   = e->params.order_qty;
         result.count++;
     }
 
-    /* Place ask (spot: only if holding inventory) */
-    if (e->inventory.can_sell()) {
-        int64_t sell_qty = e->inventory.sellable_qty((int64_t)e->params.order_qty);
-        if (sell_qty > 0) {
-            result.commands[result.count].tag   = HP_CMD_PLACE_ASK;
-            result.commands[result.count].price = ask_price;
-            result.commands[result.count].qty   = (uint64_t)sell_qty;
-            result.count++;
-        }
+    /* Place ask (skip if at max short inventory) */
+    if (!e->inventory.at_max_short()) {
+        result.commands[result.count].tag   = HP_CMD_PLACE_ASK;
+        result.commands[result.count].price = ask_price;
+        result.commands[result.count].qty   = e->params.order_qty;
+        result.count++;
     }
 
     /* Update state */

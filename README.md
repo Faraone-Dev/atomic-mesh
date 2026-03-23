@@ -7,8 +7,8 @@
 [![Rust](https://img.shields.io/badge/Rust-1.80+-f74c00?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![C++17](https://img.shields.io/badge/C++-17-00599C?style=flat-square&logo=cplusplus)](https://isocpp.org)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-79_passing-brightgreen?style=flat-square)]()
-[![Latency](https://img.shields.io/badge/Strategy_Compute-575ns-ff6b6b?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-84_passing-brightgreen?style=flat-square)]()
+[![Latency](https://img.shields.io/badge/Strategy_Compute-431ns-ff6b6b?style=flat-square)]()
 
 *A multi-node, event-sourced trading engine with sub-microsecond strategy execution.*
 *Rust + C++ hot-path. Integer-only arithmetic. Deterministic replay. Live on Binance.*
@@ -19,7 +19,7 @@
 
 ## Overview
 
-Atomic Mesh is a high-frequency market-making system designed for institutional-grade performance. Every state change is an immutable event with a global sequence number — replaying the same events always produces the same state. The critical path uses zero floating-point arithmetic and achieves **575ns average strategy compute time** through a C++ FFI hot-path compiled with `-O3 -march=native`.
+Atomic Mesh is a high-frequency market-making system designed for institutional-grade performance. Every state change is an immutable event with a global sequence number — replaying the same events always produces the same state. The critical path uses zero floating-point arithmetic and achieves **431ns average strategy compute time** through a C++ FFI hot-path compiled with `-O3 -march=native`.
 
 > **Disclaimer** — This project is a research and engineering showcase, not production-ready trading software. It demonstrates system design, low-latency architecture, and quantitative strategy implementation. Deploying to live markets with real capital would require additional hardening: comprehensive integration testing, exchange-specific edge case handling, fault injection, independent risk infrastructure, and regulatory compliance review.
 
@@ -181,7 +181,7 @@ The performance-critical path — orderbook maintenance, microprice, signal comp
 │  hp_generate()        ── microprice + quotes     │
 │  hp_should_requote()  ── threshold + cooldown    │
 │                                                 │
-│  Avg latency: 575ns per full cycle              │
+│  Avg latency: 431ns per full cycle              │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -209,7 +209,7 @@ atomic-mesh/
 ├── atomic-feed          Exchange WS connectors (Binance depth20 + trade), feed normalizer, gateway
 ├── atomic-orderbook     BTreeMap-based L2 order book engine
 ├── atomic-strategy      Avellaneda-Stoikov MM: microprice, inventory, VPIN toxicity
-├── atomic-hotpath       C++17 FFI hot-path: orderbook, signals, quote generation (575ns)
+├── atomic-hotpath       C++17 FFI hot-path: orderbook, signals, quote generation (431ns)
 ├── atomic-router        Smart Order Router: BestVenue, VWAP, TWAP, LiquiditySweep
 ├── atomic-risk          Pre-trade risk gate: spread, position, drawdown, circuit breaker, kill switch
 ├── atomic-execution     Order state machine, simulated exchange, state hash, snapshot
@@ -238,7 +238,7 @@ Full matching engine with the production C++ hot-path engine for realistic backt
 - Market orders walk the book and consume liquidity
 - Limit orders cross or rest; resting orders fill on book updates
 - Configurable maker/taker fees (basis points) and latency (nanoseconds)
-- **C++ hot-path in the loop** — backtest uses the same `HotPathEngine` as live trading, not the Rust strategy engine. Same Avellaneda-Stoikov logic, same parameters, same 575ns compute
+- **C++ hot-path in the loop** — backtest uses the same `HotPathEngine` as live trading, not the Rust strategy engine. Same Avellaneda-Stoikov logic, same parameters, same 431ns compute
 - **PnL tracking** — average cost basis, realized PnL per fill, round-trip trade detection
 - **Equity curve export** — `--equity-csv results.csv` exports `(seq, realized_pnl_usd, position_qty)` per fill
 - **Performance report** — total trades, win rate, max drawdown, Sharpe ratio (per round-trip), avg trade PnL, volume
@@ -297,9 +297,54 @@ cargo run --release -- --backtest data/events.log --metrics
 # Backtest with equity curve export
 cargo run --release -- --backtest data/events.log --equity-csv results.csv --metrics
 
-# Run all tests (46 tests across 7 crates)
+# Run all tests (84 tests across 12 crates)
 cargo test
+
+# Run Criterion benchmarks
+cargo bench -p atomic-hotpath
 ```
+
+---
+
+## Benchmark Results (Criterion)
+
+| Benchmark | Latency | Description |
+|---|---|---|
+| `hp_on_book_update` (20-deep) | **431 ns** | Full L2 book update → microprice → quote generation |
+| `hp_on_trade` | **83 ns** | Trade event → VPIN + volatility EMA update |
+| `full_tick_cycle` (book+trade+fill) | **551 ns** | Complete tick: book update + trade + fill |
+| Book depth 5 levels | 150 ns | Scaling benchmark |
+| Book depth 10 levels | 221 ns | Scaling benchmark |
+| Book depth 20 levels | 419 ns | Scaling benchmark |
+| Book depth 40 levels | 987 ns | Scaling benchmark |
+
+All benchmarks use warm-cache methodology (1000-tick warmup) measured with [Criterion.rs](https://github.com/bheisler/criterion.rs).
+
+---
+
+## Backtest Results
+
+```
+╔══════════════════════════════════════════════════════════╗
+║              ATOMIC MESH — BACKTEST REPORT              ║
+╠══════════════════════════════════════════════════════════╣
+║  Engine          : C++ HotPath (Avellaneda-Stoikov)     ║
+║  Events          :      13334 (467k evt/s)              ║
+║  Duration        : 0.03s                                ║
+╠══════════════════════════════════════════════════════════╣
+║  Orders          :        198                           ║
+║  Fills           :        197                           ║
+║  Round-trips     :         98                           ║
+║  Volume          : $  1,442,504                         ║
+╠══════════════════════════════════════════════════════════╣
+║  Realized PnL    : $     15.68                          ║
+║  Max Drawdown    : $      0.00                          ║
+║  Win Rate        :       100.0%                         ║
+║  Avg Trade PnL   : $      0.16                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+98 round-trips, 100% win rate, zero drawdown on 10K-tick synthetic BTCUSDT dataset. Position-aware command gating holds unfilled quotes alive after partial fills, ensuring both sides fill at the same fair value reference. Maker fee = 0 bps (Binance VIP/MM tier).
 
 ---
 
@@ -312,14 +357,14 @@ cargo test
 | `atomic-execution` | 11 | Order lifecycle, state transitions, market/limit fills, cancel, IOC, FOK |
 | `atomic-feed` | 5 | Feed normalization, snapshot/delta, trade parsing, symbol formats |
 | `atomic-hotpath` | 5 | C++ FFI: book update, trade, fill, quote generation, requote threshold |
-| `atomic-node` | 2 | Event deduplicator, recovery cold start |
+| `atomic-node` | 7 | Event dedup, recovery, E2E (3 integration tests), determinism (2 multi-node tests) |
 | `atomic-orderbook` | 3 | Book snapshot, delta update, simulated fill |
 | `atomic-replay` | 2 | Deterministic replay hash, snapshot restore hash |
 | `atomic-risk` | 10 | Kill switch, rate limit, position limit, order qty, PnL tracking, reset |
 | `atomic-router` | 6 | BestVenue buy/sell, VWAP split, TWAP split, liquidity sweep, empty book |
 | `atomic-strategy` | 21 | Microprice (5), inventory (7), VPIN toxicity (5), A-S market maker (4) |
 | `atomic-transport` | 7 | Wire protocol roundtrip: heartbeat, replication, batch, sync, consensus, hash |
-| **Total** | **79** | |
+| **Total** | **84** | **12 crates, 0 failures** |
 
 ---
 

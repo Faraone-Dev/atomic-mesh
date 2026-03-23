@@ -350,6 +350,7 @@ impl SimulatedExchange {
             };
 
             let limit = order.price.0;
+            // Passive maker fill: check if market crosses our resting level
             let can_cross = if let Some(book) = self.books.get(&order.symbol.pair()) {
                 match order.side {
                     Side::Buy => book.asks.keys().next().map_or(false, |&p| p <= limit),
@@ -363,47 +364,29 @@ impl SimulatedExchange {
                 continue;
             }
 
-            // Match the resting order
-            let result = if let Some(book) = self.books.get_mut(&order.symbol.pair()) {
-                let book_side = match order.side {
-                    Side::Buy => &mut book.asks,
-                    Side::Sell => &mut book.bids,
-                };
-                match_order(book_side, order.side, order.remaining, Some(limit))
-            } else {
-                continue;
-            };
-
+            // Passive maker fill at our limit price (not at the market's price)
             let fill_ts = order.submitted_at + self.config.fill_latency_ns;
-            let mut remaining = order.remaining;
+            let fill_qty = order.remaining;
+            let fee =
+                (limit * fill_qty as i64 * self.config.maker_fee_bps) / 10_000;
+            self.pending_events.push_back(Event::new(
+                0,
+                fill_ts,
+                order.source,
+                EventPayload::OrderFill(OrderFillEvent {
+                    order_id: order.order_id.clone(),
+                    symbol: order.symbol.clone(),
+                    side: order.side,
+                    price: Price(limit),
+                    qty: Qty(fill_qty),
+                    remaining: Qty(0),
+                    fee,
+                    is_maker: true,
+                    venue: Venue::Simulated,
+                }),
+            ));
 
-            for fill in &result.fills {
-                remaining = remaining.saturating_sub(fill.qty);
-                let fee =
-                    (fill.price * fill.qty as i64 * self.config.maker_fee_bps) / 10_000;
-                self.pending_events.push_back(Event::new(
-                    0,
-                    fill_ts,
-                    order.source,
-                    EventPayload::OrderFill(OrderFillEvent {
-                        order_id: order.order_id.clone(),
-                        symbol: order.symbol.clone(),
-                        side: order.side,
-                        price: Price(fill.price),
-                        qty: Qty(fill.qty),
-                        remaining: Qty(remaining),
-                        fee,
-                        is_maker: true,
-                        venue: Venue::Simulated,
-                    }),
-                ));
-            }
-
-            if result.remaining == 0 {
-                self.resting_orders.remove(&oid);
-            } else if let Some(o) = self.resting_orders.get_mut(&oid) {
-                o.remaining = result.remaining;
-            }
+            self.resting_orders.remove(&oid);
         }
     }
 

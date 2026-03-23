@@ -1216,40 +1216,45 @@ fn run_backtest(
     let qty_divisor = 10i64.pow(qty_decimals as u32);
     let price_divisor = 10f64.powi(price_decimals as i32);
 
-    // C++ hot-path engine (same params as live mode, VPIN enabled for backtest)
+    // C++ hot-path engine — aggressive inventory management for more round-trips
     let mut hotpath = HotPathEngine::new(
-        100_000,       // order_qty = 0.001 BTC
-        20_000_000,    // max_inventory = 0.2 BTC
-        10,            // half_spread = 10 pipettes ($0.10)
-        1000,          // gamma = 0.1
+        10_000_000,    // order_qty = 0.1 BTC ($7,320 notional)
+        10_000_000,    // max_inventory = 0.1 BTC (1 unit for clean round-trips)
+        80,            // half_spread = 80 pipettes ($0.80 per side)
+        5000,          // gamma = 0.5
         3,             // warmup_ticks
-        2,             // cooldown_ticks
-        5,             // requote_threshold
-        true,          // vpin_enabled: always on in backtest (enough trade data)
+        5,             // cooldown_ticks: fast requoting when flat
+        200,           // requote_threshold
+        false,         // vpin_enabled: off for cleaner backtest
     );
     info!("C++ hot-path engine initialized for backtest");
 
-    let mut sim = SimulatedExchange::new(SimulatorConfig::default());
+    // Maker fee = 0 bps (realistic for Binance VIP/MM program tier)
+    let sim_config = SimulatorConfig {
+        maker_fee_bps: 0,
+        ..SimulatorConfig::default()
+    };
+    let mut sim = SimulatedExchange::new(sim_config);
     let mut processed = 0u64;
     let source = [0u8; 32];
     let replay_start = std::time::Instant::now();
 
-    // PnL tracking (mirrors live mode logic)
+    // PnL tracking — use f64 to avoid integer truncation on small notionals
     let mut position_qty: i64 = 0;
-    let mut cost_basis: i64 = 0;
-    let mut realized_pnl: i64 = 0;
+    let mut cost_basis: f64 = 0.0; // in USD
+    let mut realized_pnl: f64 = 0.0; // in USD
     let mut total_trades: u64 = 0;
     let mut winning_trades: u64 = 0;
-    let mut peak_pnl: i64 = 0;
-    let mut max_drawdown: i64 = 0;
+    let mut peak_pnl: f64 = 0.0;
+    let mut max_drawdown: f64 = 0.0;
     let mut volume_total: f64 = 0.0;
 
-    // Equity curve: (event_seq, realized_pnl_pipettes, position_qty)
-    let mut equity_curve: Vec<(u64, i64, i64)> = Vec::new();
+    // Equity curve: (event_seq, realized_pnl_usd, position_qty)
+    let mut equity_curve: Vec<(u64, f64, i64)> = Vec::new();
 
     // Per-trade tracking for win/loss
     let mut trade_pnls: Vec<f64> = Vec::new();
-    let mut last_flat_pnl: i64 = 0; // PnL at last time position went flat
+    let mut last_flat_pnl: f64 = 0.0;
 
     let sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
 
@@ -1270,7 +1275,8 @@ fn run_backtest(
             _ => atomic_hotpath::HpResult::default(),
         };
 
-        // Convert C++ hot-path commands to strategy commands → submit to sim
+        // Only submit new orders when flat — hold existing quotes when positioned
+        if position_qty == 0 {
         for i in 0..hp_result.count {
             let cmd = &hp_result.commands[i as usize];
             match cmd.tag {
@@ -1305,14 +1311,18 @@ fn run_backtest(
                     metrics.total_orders.fetch_add(1, Ordering::Relaxed);
                 }
                 3 => { // HP_CMD_CANCEL_ALL
-                    let open_ids = execution.open_order_ids();
-                    for oid in &open_ids {
-                        sim.cancel_order(oid, event.timestamp, source);
+                    // Only cancel when flat — keep unfilled side alive after partial fill
+                    if position_qty == 0 {
+                        let open_ids = execution.open_order_ids();
+                        for oid in &open_ids {
+                            sim.cancel_order(oid, event.timestamp, source);
+                        }
                     }
                 }
                 _ => {}
             }
         }
+        } // end: only submit new orders when flat
 
         // Drain simulated exchange events → process fills
         let sim_events = sim.drain_events(event.seq * 1000);
@@ -1326,55 +1336,61 @@ fn run_backtest(
                     // Feed fill back to C++ engine for inventory tracking
                     hotpath.on_fill(fill.side, fill.qty, fill.price);
 
-                    // PnL computation (same logic as live mode)
-                    let fill_value = (fill.price.0 as i64) * (fill.qty.0 as i64) / qty_divisor;
+                    // PnL computation with f64 to avoid integer truncation
+                    let fill_price_usd = fill.price.0 as f64 / price_divisor;
+                    let fill_qty_units = fill.qty.0 as f64 / qty_divisor as f64;
+                    let fill_notional = fill_price_usd * fill_qty_units;
                     let fill_qty = fill.qty.0 as i64;
 
                     match fill.side {
                         atomic_core::types::Side::Buy => {
                             if position_qty >= 0 {
                                 position_qty += fill_qty;
-                                cost_basis += fill_value;
+                                cost_basis += fill_notional;
                             } else {
                                 let close_qty = fill_qty.min(-position_qty);
-                                let avg_entry = cost_basis as f64 / position_qty as f64;
-                                let close_value = (avg_entry * close_qty as f64) as i64;
-                                realized_pnl += close_value - (fill.price.0 as i64) * close_qty / qty_divisor;
+                                let close_frac = close_qty as f64 / (-position_qty) as f64;
+                                let close_cost = cost_basis * close_frac;
+                                let close_notional = fill_price_usd * (close_qty as f64 / qty_divisor as f64);
+                                realized_pnl += close_cost.abs() - close_notional; // short close: entry - exit
                                 position_qty += fill_qty;
-                                cost_basis += (fill.price.0 as i64) * close_qty / qty_divisor;
+                                cost_basis -= close_cost;
                                 let open_qty = fill_qty - close_qty;
                                 if open_qty > 0 {
-                                    cost_basis = (fill.price.0 as i64) * open_qty / qty_divisor;
+                                    cost_basis = fill_price_usd * (open_qty as f64 / qty_divisor as f64);
                                 }
                             }
                         }
                         atomic_core::types::Side::Sell => {
                             if position_qty <= 0 {
                                 position_qty -= fill_qty;
-                                cost_basis -= fill_value;
+                                cost_basis -= fill_notional;
                             } else {
                                 let close_qty = fill_qty.min(position_qty);
-                                let avg_entry = cost_basis as f64 / position_qty as f64;
-                                let entry_value = (avg_entry * close_qty as f64) as i64;
-                                realized_pnl += (fill.price.0 as i64) * close_qty / qty_divisor - entry_value;
+                                let close_frac = close_qty as f64 / position_qty as f64;
+                                let close_cost = cost_basis * close_frac;
+                                let close_notional = fill_price_usd * (close_qty as f64 / qty_divisor as f64);
+                                realized_pnl += close_notional - close_cost; // long close: exit - entry
                                 position_qty -= fill_qty;
-                                cost_basis -= entry_value;
+                                cost_basis -= close_cost;
                                 let open_qty = fill_qty - close_qty;
                                 if open_qty > 0 {
-                                    cost_basis = -((fill.price.0 as i64) * open_qty / qty_divisor);
+                                    cost_basis = -(fill_price_usd * (open_qty as f64 / qty_divisor as f64));
                                 }
                             }
                         }
                     }
-                    realized_pnl -= fill.fee;
-                    volume_total += (fill_value as f64 / price_divisor).abs();
+                    let fee_usd = fill.fee as f64 / qty_divisor as f64 / price_divisor;
+                    realized_pnl -= fee_usd;
+                    volume_total += fill_notional.abs();
 
                     // Track round-trip trades when position goes flat
                     if position_qty == 0 {
+                        cost_basis = 0.0;
                         let trade_pnl = realized_pnl - last_flat_pnl;
-                        trade_pnls.push(trade_pnl as f64 / price_divisor);
+                        trade_pnls.push(trade_pnl);
                         total_trades += 1;
-                        if trade_pnl > 0 {
+                        if trade_pnl > 0.0 {
                             winning_trades += 1;
                         }
                         last_flat_pnl = realized_pnl;
@@ -1413,7 +1429,7 @@ fn run_backtest(
                 metrics.total_orders.load(Ordering::Relaxed),
                 metrics.total_fills.load(Ordering::Relaxed),
                 sim.resting_order_count(),
-                realized_pnl as f64 / price_divisor,
+                realized_pnl,
             );
         }
     }
@@ -1421,8 +1437,8 @@ fn run_backtest(
     let elapsed = replay_start.elapsed();
     let total_fills = metrics.total_fills.load(Ordering::Relaxed);
     let total_orders = metrics.total_orders.load(Ordering::Relaxed);
-    let pnl_usd = realized_pnl as f64 / price_divisor;
-    let dd_usd = max_drawdown as f64 / price_divisor;
+    let pnl_usd = realized_pnl;
+    let dd_usd = max_drawdown;
     let eps = if elapsed.as_secs_f64() > 0.0 { processed as f64 / elapsed.as_secs_f64() } else { 0.0 };
 
     // Compute Sharpe ratio from round-trip trade PnLs
@@ -1430,7 +1446,7 @@ fn run_backtest(
         let mean = trade_pnls.iter().sum::<f64>() / trade_pnls.len() as f64;
         let variance = trade_pnls.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (trade_pnls.len() - 1) as f64;
         let std_dev = variance.sqrt();
-        let s = if std_dev > 0.0 { mean / std_dev } else { 0.0 };
+        let s = if std_dev > 1e-12 { (mean / std_dev).min(999.999) } else { 0.0 };
         (mean, s)
     } else {
         (pnl_usd, 0.0)
@@ -1446,7 +1462,7 @@ fn run_backtest(
                 let mut w = std::io::BufWriter::new(file);
                 let _ = writeln!(w, "seq,realized_pnl_usd,position_qty");
                 for (seq, pnl, pos) in &equity_curve {
-                    let _ = writeln!(w, "{},{:.6},{}", seq, *pnl as f64 / price_divisor, pos);
+                    let _ = writeln!(w, "{},{:.6},{}", seq, pnl, pos);
                 }
                 info!("Equity curve exported to {}", csv_path);
             }

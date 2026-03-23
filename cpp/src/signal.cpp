@@ -115,24 +115,15 @@ struct alignas(HP_CACHELINE) InventoryState {
     void on_fill(int32_t side, uint64_t qty, int64_t price) {
         int64_t signed_qty = (int64_t)qty;
         if (side > 0) {
-            /* Buy: increase position */
-            /* Update cost basis (weighted average) */
-            if (position_qty + signed_qty > 0) {
-                cost_basis = (cost_basis * position_qty + price * signed_qty)
-                           / (position_qty + signed_qty);
-            }
+            /* Buy (side=1 from hp_on_fill): increase position */
             position_qty += signed_qty;
         } else {
-            /* Sell: decrease position, realize P&L */
-            int64_t sell_qty = signed_qty;
-            if (sell_qty > position_qty) sell_qty = position_qty;
-            realized_pnl += (price - cost_basis) * sell_qty;
-            position_qty -= sell_qty;
+            /* Sell (side=-1): decrease position (can go short) */
+            position_qty -= signed_qty;
         }
-        /* Spot-safe: clamp to zero */
-        if (position_qty < 0) position_qty = 0;
-        /* Clamp to max */
+        /* Clamp to ±max_inventory */
         if (position_qty > max_inventory) position_qty = max_inventory;
+        if (position_qty < -max_inventory) position_qty = -max_inventory;
     }
 
     /*
@@ -147,16 +138,11 @@ struct alignas(HP_CACHELINE) InventoryState {
         return gamma * position_qty * half_spread / (10000 * max_inventory);
     }
 
-    bool at_max() const {
+    bool at_max_long() const {
         return position_qty >= max_inventory;
     }
 
-    bool can_sell() const {
-        return position_qty > 0;
-    }
-
-    int64_t sellable_qty(int64_t order_qty) const {
-        if (position_qty <= 0) return 0;
-        return (position_qty < order_qty) ? position_qty : order_qty;
+    bool at_max_short() const {
+        return position_qty <= -max_inventory;
     }
 };
