@@ -7,6 +7,10 @@ edition = "2021"
 name = "atomic-node"
 path = "src/main.rs"
 
+[[bin]]
+name = "generate-backtest-data"
+path = "src/bin/generate_backtest_data.rs"
+
 [dependencies]
 atomic-core = { path = "../atomic-core" }
 atomic-bus = { path = "../atomic-bus" }
@@ -31,3 +35,11 @@ futures-util = "0.3"
 dotenvy = "0.15"
 axum = { version = "0.8", features = ["ws"] }
 open = "5"
+
+[dev-dependencies]
+atomic-core = { path = "../atomic-core" }
+atomic-hotpath = { path = "../atomic-hotpath" }
+atomic-execution = { path = "../atomic-execution" }
+atomic-risk = { path = "../atomic-risk" }
+atomic-replay = { path = "../atomic-replay" }
+hex = { workspace = true }

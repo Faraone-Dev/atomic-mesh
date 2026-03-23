@@ -9,5 +9,12 @@ description = "C++ hot-path FFI for nanosecond-scale order book + strategy proce
 atomic-core = { path = "../atomic-core" }
 tracing = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "engine"
+harness = false
+
 [build-dependencies]
 cc = "1"
