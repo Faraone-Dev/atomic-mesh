@@ -137,6 +137,13 @@ fn run_pipeline(events: &[Event]) -> (i64, u64, [u8; 8]) {
                     time_in_force: TimeInForce::GoodTilCancel,
                     venue: Venue::Simulated,
                 };
+                let order_event = Event::new(
+                    0,
+                    event.timestamp,
+                    source,
+                    EventPayload::OrderNew(order_new.clone()),
+                );
+                let _ = execution.process_event(&order_event);
                 sim.submit_order(&order_new, event.timestamp, source);
             }
         }

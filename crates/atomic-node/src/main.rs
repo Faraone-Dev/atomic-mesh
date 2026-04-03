@@ -22,7 +22,10 @@ use atomic_hotpath::HotPathEngine;
 use atomic_transport::MeshTransport;
 use atomic_transport::protocol::MeshMessage;
 use atomic_node::{NodeConfig, RecoveryCoordinator, EventDeduplicator};
-use atomic_node::dashboard::{DashboardState, DashboardEvent, start_dashboard};
+use atomic_node::dashboard::{
+    DashboardState, DashboardEvent, start_dashboard,
+    KILL_STOP_ALL, KILL_CANCEL_ALL, KILL_DISCONNECT,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "atomic-node", about = "ATOMIC MESH — Distributed Deterministic Trading Engine")]
@@ -415,6 +418,7 @@ async fn main() {
         symbols: config.feeds.iter().flat_map(|f| f.symbols.clone()).collect(),
         kill_action: std::sync::atomic::AtomicU8::new(0),
     });
+    let dash_state_main = Arc::clone(&dash_state);
     tokio::spawn(start_dashboard(cli.dashboard_port, dash_state));
 
     // Auto-open dashboard in browser
@@ -442,6 +446,7 @@ async fn main() {
     let mut last_seq = plan.expected_next_seq;
     let mut order_send_times: HashMap<String, std::time::Instant> = HashMap::new();
     let mut last_price_display = String::from("—");
+    let mut last_mid_price_pipettes: i64 = 0;
     let mut msg_count: u64 = 0;
     let mut last_msg_count: u64 = 0;
     let mut last_rate_check = std::time::Instant::now();
@@ -460,6 +465,12 @@ async fn main() {
     let mut cost_basis: i64 = 0;         // total cost in pipettes (price * qty / qty_divisor)
     let mut realized_pnl: i64 = 0;       // cumulative realized PnL in pipettes
     let mut last_flat_pnl: i64 = 0;      // PnL snapshot at last flat position (for round-trip tracking)
+    let primary_symbol = config
+        .feeds
+        .first()
+        .and_then(|f| f.symbols.first())
+        .cloned()
+        .unwrap_or_else(|| "BTCUSDT".to_string());
 
     loop {
         tokio::select! {
@@ -500,6 +511,7 @@ async fn main() {
 
                     // Always update live price for topbar
                     if let Some(mid) = book.mid_price() {
+                        last_mid_price_pipettes = mid.0;
                         last_price_display = format!("{:.2}", mid.to_f64(price_decimals));
                     }
 
@@ -537,6 +549,54 @@ async fn main() {
 
                 // Process through execution engine (for replay determinism)
                 let _ = execution.process_event(&event);
+
+                // Apply any kill switch action requested via dashboard.
+                match dash_state_main.pending_kill_action() {
+                    KILL_STOP_ALL => {
+                        risk.activate_kill_switch("manual STOP ALL from dashboard");
+                        let open_ids = execution.open_order_ids();
+                        if let Some(ref gw) = gateway {
+                            let gw = Arc::clone(gw);
+                            let sym = primary_symbol.clone();
+                            tokio::spawn(async move {
+                                gw.cancel_all_open_orders(&sym).await;
+                            });
+                        }
+                        for _ in &open_ids {
+                            risk.on_order_closed();
+                        }
+                        warn!("Dashboard kill action: STOP ALL executed (kill switch active)");
+                    }
+                    KILL_CANCEL_ALL => {
+                        let open_ids = execution.open_order_ids();
+                        if let Some(ref gw) = gateway {
+                            let gw = Arc::clone(gw);
+                            let sym = primary_symbol.clone();
+                            tokio::spawn(async move {
+                                gw.cancel_all_open_orders(&sym).await;
+                            });
+                        }
+                        for _ in &open_ids {
+                            risk.on_order_closed();
+                        }
+                        warn!("Dashboard kill action: CANCEL ALL executed");
+                    }
+                    KILL_DISCONNECT => {
+                        let open_ids = execution.open_order_ids();
+                        if let Some(ref gw) = gateway {
+                            let gw = Arc::clone(gw);
+                            let sym = primary_symbol.clone();
+                            tokio::spawn(async move {
+                                gw.cancel_all_open_orders(&sym).await;
+                            });
+                        }
+                        for _ in &open_ids {
+                            risk.on_order_closed();
+                        }
+                        warn!("Dashboard kill action: DISCONNECT requested (gateway sessions cannot be force-closed yet, orders canceled)");
+                    }
+                    _ => {}
+                }
 
                 // ── C++ HOT PATH ─────────────────────────────────────
                 // Route event through the C++ engine (~100-500ns) instead
@@ -610,9 +670,36 @@ async fn main() {
                         atomic_strategy::StrategyCommand::PlaceOrder {
                             symbol, side, order_type, price, qty, time_in_force, venue,
                         } => {
+                            let venue_for_position = symbol.venue;
+                            let pos_symbol = symbol.clone();
+                            let maybe_position = if position_qty != 0 {
+                                let side = if position_qty > 0 {
+                                    atomic_core::types::Side::Buy
+                                } else {
+                                    atomic_core::types::Side::Sell
+                                };
+                                Some(atomic_core::types::Position {
+                                    symbol: pos_symbol,
+                                    side,
+                                    qty: atomic_core::types::Qty(position_qty.unsigned_abs()),
+                                    avg_entry: atomic_core::types::Price(if position_qty == 0 { 0 } else { cost_basis / position_qty }),
+                                    unrealized_pnl: 0,
+                                    realized_pnl,
+                                })
+                            } else {
+                                None
+                            };
+
                             // Risk check
                             let _rtimer = atomic_core::metrics::StageTimer::start(&metrics.risk_check);
-                            let risk_result = risk.check_order(&symbol, side, qty, price, None, event.timestamp);
+                            let risk_result = risk.check_order(
+                                &symbol,
+                                side,
+                                qty,
+                                price,
+                                maybe_position.as_ref(),
+                                event.timestamp,
+                            );
                             drop(_rtimer);
 
                             if let Err(e) = risk_result {
@@ -685,17 +772,20 @@ async fn main() {
                                 qty: format!("{:.8}", qty.to_f64(qty_decimals)),
                                 filled_qty: "0".to_string(),
                                 state: "New".to_string(),
-                                venue: format!("{}", venue),
+                                venue: format!("{}", venue_for_position),
                                 latency_ns: 0,
                             });
 
                             // Push risk state to dashboard
+                            let exposure_pipettes = (position_qty.unsigned_abs() as i64)
+                                .saturating_mul(last_mid_price_pipettes)
+                                / qty_divisor;
                             let _ = dash_tx.send(DashboardEvent::Risk {
                                 open_orders: risk.open_order_count() as u64,
                                 max_open: config.risk.max_open_orders as u64,
                                 daily_loss: format!("{:.2}", risk.total_pnl() as f64 / price_divisor),
                                 max_daily_loss: format!("{:.2}", config.risk.max_loss as f64 / price_divisor),
-                                exposure: "0.00".to_string(),
+                                exposure: format!("{:.2}", exposure_pipettes as f64 / price_divisor),
                                 max_exposure: format!("{:.2}", config.risk.max_notional as f64 / price_divisor),
                                 drawdown_pct: "0.00".to_string(),
                                 max_drawdown_pct: "0.00".to_string(),
@@ -910,21 +1000,29 @@ async fn main() {
                         }
 
                         // --- Emit PnL to dashboard ---
+                        let drawdown_pct = if risk.peak_pnl() > 0 {
+                            (risk.peak_pnl() - risk.total_pnl()) as f64 / risk.peak_pnl() as f64 * 100.0
+                        } else {
+                            0.0
+                        };
                         let _ = dash_tx.send(DashboardEvent::Pnl {
                             total_realized: format!("{:.2}", pnl_usd),
                             total_unrealized: "0.00".to_string(),
                             total_pnl: format!("{:.2}", pnl_usd),
-                            drawdown: "0.00".to_string(),
+                            drawdown: format!("{:.2}%", drawdown_pct),
                             volume: format!("{:.2}", volume_session),
                         });
 
                         // --- Emit Risk to dashboard ---
+                        let exposure_pipettes = (position_qty.unsigned_abs() as i64)
+                            .saturating_mul(last_mid_price_pipettes)
+                            / qty_divisor;
                         let _ = dash_tx.send(DashboardEvent::Risk {
                             open_orders: risk.open_order_count() as u64,
                             max_open: config.risk.max_open_orders as u64,
                             daily_loss: format!("{:.2}", risk.total_pnl() as f64 / price_divisor),
                             max_daily_loss: format!("{:.2}", config.risk.max_loss as f64 / price_divisor),
-                            exposure: "0.00".to_string(),
+                            exposure: format!("{:.2}", exposure_pipettes as f64 / price_divisor),
                             max_exposure: format!("{:.2}", config.risk.max_notional as f64 / price_divisor),
                             drawdown_pct: "0.00".to_string(),
                             max_drawdown_pct: "0.00".to_string(),
@@ -949,12 +1047,12 @@ async fn main() {
                         // Update order in dashboard with latency
                         let _ = dash_tx.send(DashboardEvent::Order {
                             id: ack.order_id.0.clone(),
-                            symbol: String::new(),
-                            side: String::new(),
-                            order_type: String::new(),
-                            price: String::new(),
-                            qty: String::new(),
-                            filled_qty: String::new(),
+                            symbol: execution.get_order(&ack.order_id.0).map(|o| format!("{}{}", o.symbol.base, o.symbol.quote)).unwrap_or_default(),
+                            side: execution.get_order(&ack.order_id.0).map(|o| format!("{:?}", o.side)).unwrap_or_default(),
+                            order_type: execution.get_order(&ack.order_id.0).map(|o| format!("{:?}", o.order_type)).unwrap_or_default(),
+                            price: execution.get_order(&ack.order_id.0).map(|o| format!("{:.2}", o.price.to_f64(price_decimals))).unwrap_or_default(),
+                            qty: execution.get_order(&ack.order_id.0).map(|o| format!("{:.8}", o.original_qty.to_f64(qty_decimals))).unwrap_or_default(),
+                            filled_qty: execution.get_order(&ack.order_id.0).map(|o| format!("{:.8}", o.filled_qty.to_f64(qty_decimals))).unwrap_or_default(),
                             state: "Acked".to_string(),
                             venue: format!("{}", ack.venue),
                             latency_ns,
@@ -1003,6 +1101,7 @@ async fn main() {
                     last_flat_pnl = 0;
                     realized_pnl = 0;
                     cost_basis = 0;
+                    position_qty = 0;
                 }
 
                 // Push dashboard tick
@@ -1039,12 +1138,15 @@ async fn main() {
                 let drawdown_pct = if risk.peak_pnl() > 0 {
                     (risk.peak_pnl() - risk.total_pnl()) as f64 / risk.peak_pnl() as f64 * 100.0
                 } else { 0.0 };
+                let exposure_pipettes = (position_qty.unsigned_abs() as i64)
+                    .saturating_mul(last_mid_price_pipettes)
+                    / qty_divisor;
                 let _ = dash_tx.send(DashboardEvent::Risk {
                     open_orders: risk.open_order_count() as u64,
                     max_open: config.risk.max_open_orders as u64,
                     daily_loss: format!("{:.2}", risk.total_pnl() as f64 / price_divisor),
                     max_daily_loss: format!("{:.2}", config.risk.max_loss as f64 / price_divisor),
-                    exposure: "0.00".to_string(),
+                    exposure: format!("{:.2}", exposure_pipettes as f64 / price_divisor),
                     max_exposure: format!("{:.2}", config.risk.max_notional as f64 / price_divisor),
                     drawdown_pct: format!("{:.2}", drawdown_pct),
                     max_drawdown_pct: format!("{:.2}", config.risk.max_drawdown_bps as f64 / 100.0),
@@ -1292,6 +1394,13 @@ fn run_backtest(
                         time_in_force: atomic_core::types::TimeInForce::GoodTilCancel,
                         venue: Venue::Simulated,
                     };
+                    let order_event = Event::new(
+                        event.seq * 1000 + i as u64,
+                        event.timestamp,
+                        source,
+                        EventPayload::OrderNew(order_new.clone()),
+                    );
+                    let _ = execution.process_event(&order_event);
                     sim.submit_order(&order_new, event.timestamp, source);
                     metrics.total_orders.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1307,6 +1416,13 @@ fn run_backtest(
                         time_in_force: atomic_core::types::TimeInForce::GoodTilCancel,
                         venue: Venue::Simulated,
                     };
+                    let order_event = Event::new(
+                        event.seq * 1000 + i as u64,
+                        event.timestamp,
+                        source,
+                        EventPayload::OrderNew(order_new.clone()),
+                    );
+                    let _ = execution.process_event(&order_event);
                     sim.submit_order(&order_new, event.timestamp, source);
                     metrics.total_orders.fetch_add(1, Ordering::Relaxed);
                 }
