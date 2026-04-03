@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.80+-f74c00?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![C++17](https://img.shields.io/badge/C++-17-00599C?style=flat-square&logo=cplusplus)](https://isocpp.org)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-84_passing-brightgreen?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-85_passing-brightgreen?style=flat-square)]()
 [![Latency](https://img.shields.io/badge/Strategy_Compute-431ns-ff6b6b?style=flat-square)]()
 
 *A multi-node, event-sourced trading engine with sub-microsecond strategy execution.*
@@ -36,7 +36,7 @@ Atomic Mesh is a high-frequency market-making system designed for institutional-
    trade stream)   │  + Norm    Ring)    C++ HP FFI        │         │
                     │     │        │        │               ▼         │
                     │  Metrics  Metrics  Metrics      Execution ◄─ Risk
-                    │  (per     (per     (575ns)      Engine      Engine
+                    │  (per     (per     (431ns)      Engine      Engine
                     │   stage)   stage)     │            │            │
                     │                      ▼            ▼            │
                     │                Event Log     Exchange API      │
@@ -71,9 +71,22 @@ Cumulative P&L with equity curve, live L2 order book (depth-20 with bid/ask imba
 
 ### Debug — Strategy Inspector
 
-![Debug Dashboard](dashboard-debug.png)
-
 Avellaneda-Stoikov market maker internals: quote count, order/fill ratio, realized P&L per strategy instance. State hash monitor for cross-node determinism verification.
+
+### Risk — Controls & Kill Switch
+
+![Risk Dashboard](dashboard-risk-panel.png)
+
+Dedicated risk panel with live limits, drawdown tracking, and emergency controls (`STOP ALL`, `CANCEL ALL ORDERS`, `DISCONNECT`) routed to the live loop.
+
+---
+
+## Recent Hardening (Apr 2026)
+
+- Spread units are now consistently defined as **pipettes** across Rust strategy, Rust FFI wrapper, and C++ hot-path API (`half_spread_pipettes` naming).
+- Live command routing no longer assumes `BTCUSDT`; order/cancel paths derive symbol context from incoming events and tracked orders.
+- Dashboard kill actions are wired into the live loop and trigger real cancel/kill workflows.
+- Backtest + E2E/determinism paths register `OrderNew` before simulator acks/fills, so lifecycle validation matches production state-machine semantics.
 
 ---
 
@@ -155,6 +168,7 @@ Automatically pauses quoting on adverse patterns. Resets at UTC midnight via `da
 Global atomic boolean. Once fired, **all orders are rejected** until manual `reset_kill_switch()`:
 
 - Triggers when `total_pnl < max_loss` (absolute loss limit)
+- Dashboard `STOP ALL` also activates kill mode in the live loop
 - Only human override can restart — not automated
 
 ### Daily Reset
@@ -162,7 +176,7 @@ Global atomic boolean. Once fired, **all orders are rejected** until manual `res
 On UTC midnight (detected via heartbeat tick every 5s):
 - Circuit breaker cleared
 - Consecutive losses reset
-- PnL, volume, cost basis zeroed
+- PnL baseline and drawdown peak reset for a clean new session
 - New trading session starts clean
 
 ---
@@ -170,6 +184,8 @@ On UTC midnight (detected via heartbeat tick every 5s):
 ## C++ Hot-Path (FFI)
 
 The performance-critical path — orderbook maintenance, microprice, signal computation, and quote generation — is implemented in C++17 and called via FFI through Rust's `cc` crate. Compiled with `-O3 -march=native` for native SIMD and branch prediction optimization.
+
+Spread configuration in the hot path is pipette-based (`half_spread_pipettes`), matching the integer `Price(i64)` model.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -297,7 +313,7 @@ cargo run --release -- --backtest data/events.log --metrics
 # Backtest with equity curve export
 cargo run --release -- --backtest data/events.log --equity-csv results.csv --metrics
 
-# Run all tests (84 tests across 12 crates)
+# Run all tests (85 tests across 12 crates)
 cargo test
 
 # Run Criterion benchmarks
@@ -360,11 +376,11 @@ All benchmarks use warm-cache methodology (1000-tick warmup) measured with [Crit
 | `atomic-node` | 7 | Event dedup, recovery, E2E (3 integration tests), determinism (2 multi-node tests) |
 | `atomic-orderbook` | 3 | Book snapshot, delta update, simulated fill |
 | `atomic-replay` | 2 | Deterministic replay hash, snapshot restore hash |
-| `atomic-risk` | 10 | Kill switch, rate limit, position limit, order qty, PnL tracking, reset |
+| `atomic-risk` | 11 | Kill switch, rate limit, position limit, order qty, PnL tracking, daily-reset baseline |
 | `atomic-router` | 6 | BestVenue buy/sell, VWAP split, TWAP split, liquidity sweep, empty book |
 | `atomic-strategy` | 21 | Microprice (5), inventory (7), VPIN toxicity (5), A-S market maker (4) |
 | `atomic-transport` | 7 | Wire protocol roundtrip: heartbeat, replication, batch, sync, consensus, hash |
-| **Total** | **84** | **12 crates, 0 failures** |
+| **Total** | **85** | **12 crates, 0 failures** |
 
 ---
 
