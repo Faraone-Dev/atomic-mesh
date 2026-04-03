@@ -221,6 +221,20 @@ impl ExecutionEngine {
             .collect()
     }
 
+    /// Return OrderIds of open orders whose last update is older than `timeout_ns`.
+    /// These are likely stuck (ack'd but no fill/cancel from exchange).
+    pub fn stale_order_ids(&self, now_ns: u64, timeout_ns: u64) -> Vec<OrderId> {
+        self.orders
+            .values()
+            .filter(|o| {
+                !o.state.is_terminal()
+                    && o.state != OrderState::New
+                    && now_ns.saturating_sub(o.updated_at) > timeout_ns
+            })
+            .map(|o| o.order_id.clone())
+            .collect()
+    }
+
     pub fn all_orders(&self) -> &HashMap<String, LiveOrder> {
         &self.orders
     }
@@ -432,5 +446,38 @@ mod tests {
         engine.register_order(order).unwrap();
         // Can't fill without ack
         assert!(engine.on_fill(&oid.0, Qty(50), Price(60000), 1001).is_err());
+    }
+
+    #[test]
+    fn stale_order_detection() {
+        let mut engine = ExecutionEngine::new();
+        let oid = engine.next_order_id(Venue::Binance);
+        let order = LiveOrder::new(
+            oid.clone(),
+            atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance),
+            Side::Buy,
+            OrderType::Limit,
+            Price(60000),
+            Qty(100),
+            TimeInForce::GoodTilCancel,
+            Venue::Binance,
+            1000, // created_at = 1000ns
+        );
+        engine.register_order(order).unwrap();
+        engine.on_ack(&oid.0, "EX1".into(), 2000).unwrap(); // updated_at = 2000ns
+
+        // Not stale yet (only 3000ns elapsed, timeout = 10_000ns)
+        let stale = engine.stale_order_ids(5000, 10_000);
+        assert!(stale.is_empty());
+
+        // Now stale (13000ns since update, timeout = 10_000ns)
+        let stale = engine.stale_order_ids(13_000, 10_000);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0], oid);
+
+        // Filled orders are not stale
+        engine.on_fill(&oid.0, Qty(100), Price(60000), 15_000).unwrap();
+        let stale = engine.stale_order_ids(100_000, 10_000);
+        assert!(stale.is_empty());
     }
 }

@@ -30,5 +30,16 @@
     "api_key_env": "ATOMIC_API_KEY",
     "api_secret_env": "ATOMIC_API_SECRET",
     "enabled": true
+  },
+  "strategy": {
+    "order_qty": 100000,
+    "max_inventory": 20000000,
+    "half_spread_pipettes": 10,
+    "gamma": 1000,
+    "warmup_ticks": 3,
+    "cooldown_ticks": 2,
+    "requote_threshold": 5,
+    "vpin_enabled": null,
+    "stale_order_timeout_secs": 30
   }
 }

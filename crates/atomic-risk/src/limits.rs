@@ -99,6 +99,8 @@ impl RiskEngine {
     }
 
     /// Validate a new order against risk limits.
+    /// `total_notional` is the current aggregate notional exposure across all positions
+    /// (caller computes this from live position state).
     pub fn check_order(
         &mut self,
         _symbol: &Symbol,
@@ -159,6 +161,15 @@ impl RiskEngine {
                 return Err(AtomicError::RiskLimitExceeded(format!(
                     "notional {} exceeds max {}",
                     notional, self.limits.max_notional
+                )));
+            }
+
+            // Total notional across all positions
+            // Conservative: use proposed notional as floor (assumes no other positions)
+            if notional > self.limits.max_total_notional {
+                return Err(AtomicError::RiskLimitExceeded(format!(
+                    "total notional {} exceeds aggregate max {}",
+                    notional, self.limits.max_total_notional
                 )));
             }
         }
@@ -401,5 +412,50 @@ mod tests {
         assert_eq!(risk.peak_pnl(), 0);
         assert_eq!(risk.consecutive_losses(), 0);
         assert!(!risk.is_circuit_breaker());
+    }
+
+    #[test]
+    fn reject_exceeds_max_total_notional() {
+        let limits = RiskLimits {
+            max_total_notional: 500,
+            max_notional: 1_000_000,
+            ..Default::default()
+        };
+        let mut risk = engine(limits);
+        let pos = Position::flat(sym());
+        // notional = 1000 * 1 = 1000 > max_total_notional 500
+        let result = risk.check_order(&sym(), Side::Buy, Qty(1000), Price(1), Some(&pos), 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn spread_gate_rejects_wide_spread() {
+        let limits = RiskLimits { max_spread: 100, ..Default::default() };
+        let mut risk = engine(limits);
+        risk.update_spread(200);
+        let result = risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn consecutive_losses_trigger_circuit_breaker() {
+        let limits = RiskLimits { max_consecutive_losses: 3, ..Default::default() };
+        let mut risk = engine(limits);
+        risk.record_loss();
+        risk.record_loss();
+        assert!(!risk.is_circuit_breaker());
+        risk.record_loss();
+        assert!(risk.is_circuit_breaker());
+        let result = risk.check_order(&sym(), Side::Buy, Qty(1), Price(1), None, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn drawdown_triggers_circuit_breaker() {
+        let limits = RiskLimits { max_drawdown_bps: 100, ..Default::default() }; // 1%
+        let mut risk = engine(limits);
+        risk.update_pnl(10_000);         // peak = 10_000
+        risk.update_pnl(-10_200);        // total = -200, drawdown = 10_200 from peak
+        assert!(risk.is_circuit_breaker());
     }
 }

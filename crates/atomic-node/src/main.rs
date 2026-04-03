@@ -264,10 +264,10 @@ async fn main() {
                 &strat_id,
                 symbol,
                 feed_cfg.venue,
-                100_000,      // order_qty = 0.001 BTC (~$74)
-                20_000_000,   // max_inventory = 0.2 BTC
-                15,           // half_spread = 15 pipettes ($0.15)
-                1000,         // gamma = 0.1 risk aversion (aggressive)
+                config.strategy.order_qty,
+                config.strategy.max_inventory as i64,
+                config.strategy.half_spread_pipettes,
+                config.strategy.gamma,
             );
             strategy_engine.register(Box::new(mm));
         }
@@ -276,17 +276,20 @@ async fn main() {
     info!("Registered {} strategies", strategy_engine.strategy_count());
 
     // C++ hot-path engine: same parameters as Rust MM but runs in ~100ns
+    let vpin_enabled = config.strategy.vpin_enabled
+        .unwrap_or_else(|| !config.gateway.is_testnet());
     let mut hotpath = HotPathEngine::new(
-        100_000,       // order_qty = 0.001 BTC (~$74)
-        20_000_000,    // max_inventory = 0.2 BTC
-        10,            // half_spread = 10 pipettes ($0.10)
-        1000,          // gamma = 0.1 (aggressive)
-        3,             // warmup_ticks
-        2,             // cooldown_ticks (faster requote)
-        5,             // requote_threshold = $0.05 (requote on small moves)
-        !config.gateway.is_testnet(), // vpin_enabled: on in live, off on testnet (too few trades)
+        config.strategy.order_qty,
+        config.strategy.max_inventory as i64,
+        config.strategy.half_spread_pipettes as i32,
+        config.strategy.gamma as i32,
+        config.strategy.warmup_ticks as i32,
+        config.strategy.cooldown_ticks as i32,
+        config.strategy.requote_threshold,
+        vpin_enabled,
     );
-    info!("C++ hot-path engine initialized");
+    info!("C++ hot-path engine initialized (spread={}pip, gamma={}, vpin={})",
+        config.strategy.half_spread_pipettes, config.strategy.gamma, vpin_enabled);
 
     let primary_symbol_obj = config
         .feeds
@@ -330,6 +333,7 @@ async fn main() {
     };
 
     // Cancel stale open orders from previous sessions
+    let mut user_data_handle: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(ref gw) = gateway {
         for feed_cfg in &config.feeds {
             for sym_str in &feed_cfg.symbols {
@@ -337,7 +341,7 @@ async fn main() {
             }
         }
         // Start user data stream for fill notifications
-        gw.start_user_data_stream().await;
+        user_data_handle = gw.start_user_data_stream().await;
 
         // Seed MM with initial inventory via market buy (testnet only)
         if config.gateway.is_testnet() {
@@ -1149,6 +1153,31 @@ async fn main() {
                     position_qty = 0;
                 }
 
+                // Stale order detection — cancel orders stuck in Ack/PartialFill
+                let stale_timeout_ns = config.strategy.stale_order_timeout_secs * 1_000_000_000;
+                let stale_ids = execution.stale_order_ids(wall_clock.now_nanos(), stale_timeout_ns);
+                if !stale_ids.is_empty() {
+                    warn!("Detected {} stale orders (>{}s without update) — cancelling",
+                        stale_ids.len(), config.strategy.stale_order_timeout_secs);
+                    for oid in &stale_ids {
+                        if let Some(ref gw) = gateway {
+                            let gw = Arc::clone(gw);
+                            let oid = oid.clone();
+                            let sym = execution
+                                .get_order(&oid.0)
+                                .map(|o| o.symbol.clone())
+                                .unwrap_or_else(|| primary_symbol_obj.clone());
+                            let seq = last_seq;
+                            let ts = wall_clock.now_nanos();
+                            tokio::spawn(async move {
+                                gw.cancel_order(&oid, &sym, seq, ts).await;
+                            });
+                        } else {
+                            risk.on_order_closed();
+                        }
+                    }
+                }
+
                 // Push dashboard tick
                 let rate_elapsed = last_rate_check.elapsed().as_secs_f64();
                 if rate_elapsed >= 1.0 {
@@ -1238,6 +1267,11 @@ async fn main() {
             gw.cancel_order(&oid, &sym, last_seq, wall_clock.now_nanos()).await;
         }
         info!("All open orders cancelled.");
+    }
+    // Abort user data stream task
+    if let Some(handle) = user_data_handle {
+        handle.abort();
+        info!("User data stream shut down.");
     }
 
     let _ = event_log.flush();

@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.80+-f74c00?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![C++17](https://img.shields.io/badge/C++-17-00599C?style=flat-square&logo=cplusplus)](https://isocpp.org)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-85_passing-brightgreen?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-92_passing-brightgreen?style=flat-square)]()
 [![Latency](https://img.shields.io/badge/Strategy_Compute-431ns-ff6b6b?style=flat-square)]()
 
 *A multi-node, event-sourced trading engine with sub-microsecond strategy execution.*
@@ -87,11 +87,15 @@ Dedicated risk panel with live limits, drawdown tracking, and emergency controls
 - Live command routing no longer assumes `BTCUSDT`; order/cancel paths derive symbol context from incoming events and tracked orders.
 - Dashboard kill actions are wired into the live loop and trigger real cancel/kill workflows.
 - Backtest + E2E/determinism paths register `OrderNew` before simulator acks/fills, so lifecycle validation matches production state-machine semantics.
+- **Strategy parameters moved to `config.json`** — order qty, spread, gamma, warmup, cooldown, requote threshold, VPIN toggle. No more magic numbers in source.
+- **Gateway graceful shutdown** — user data stream task handle is stored and aborted on Ctrl+C; open orders are cancelled before exit.
+- **Stale order detection** — heartbeat loop auto-cancels orders stuck in Ack/PartialFill beyond a configurable timeout (default 30s).
+- **`max_total_notional` enforced** — aggregate notional cap in `RiskEngine::check_order()` is now active.
+- **Kill switch E2E test** — full pipeline test: orders placed → kill switch fired → all subsequent orders rejected → open orders cancelled.
 
 ## Known Gaps (Concise)
 
 - Multi-symbol risk/exposure aggregation is still single-position centric in live accounting and dashboard views.
-- `DISCONNECT` currently cancels open orders but does not fully tear down gateway/user-data sessions.
 - Backtest remains synthetic-data based; live-paper forward stats are still needed for market-edge validation.
 
 ---
@@ -102,98 +106,7 @@ The core strategy implements the [Avellaneda-Stoikov (2008)](https://doi.org/10.
 
 ### Microprice
 
-Computes the volume-weighted fair value from the order book — not the naive midpoint:
-
-```
-microprice = (ask × bid_vol + bid × ask_vol) / (bid_vol + ask_vol)
-```
-
-Uses multi-level depth weighting with linearly decreasing weights across the top N levels. Computes book imbalance as `(bid_vol − ask_vol) / total` scaled to basis points. The microprice predicts the next trade direction better than the midpoint because it reflects where pending supply and demand actually sit.
-
-### Inventory Skew
-
-Avellaneda-Stoikov inventory skew — the MM quotes asymmetrically based on its position to control risk:
-
-```
-skew = γ × (position / max_position) × half_spread
-```
-
-When long, the ask is lowered to sell faster. When flat, quotes are symmetric. Position is clamped at zero on spot exchanges — the MM never enters a short position. Sell quantity is capped to actual holdings.
-
-### Toxicity Detection (VPIN)
-
-VPIN-lite (Volume-Synchronized Probability of Informed Trading) detects adverse selection in real time:
-
-```
-VPIN = |buy_vol − sell_vol| / total_vol    (rolling 200-tick window)
-```
-
-Rolling trade window measures buy/sell volume imbalance. Volatility EMA tracks `|Δprice|` for dynamic spread adjustment. A spread multiplier (1.0× – 3.0×) combines toxicity and volatility to widen spread under stress. When flow turns toxic, all quotes are pulled immediately via CancelAll.
-
-### Quote Engine
-
-Orchestrates all modules into a continuous quoting loop:
-
-```
-bid = microprice − half_spread × toxicity_mult − inventory_skew
-ask = microprice + half_spread × toxicity_mult − inventory_skew
-```
-
-On **book update**: recompute microprice, requote if fair value moved beyond threshold. On **trade**: feed toxicity tracker, pull quotes if VPIN spikes. On **fill**: update inventory, reset cooldown for immediate requote. Configurable warmup period (K book updates) and cooldown (N ticks between requotes).
-
----
-
-## Pre-Trade Risk Gate
-
-Three-tier risk hierarchy designed for market-making — rejects toxic orders before they leave the node:
-
-### Tier 1 — Per-Order Gate (microsecond)
-
-Every order passes through `check_order()` before routing to execution:
-
-| Check | What it does |
-|---|---|
-| **Spread gate** | Rejects quoting when `spread > max_spread`. Protects against adverse selection during flash crashes, halts, and illiquid conditions. Fed by live book spread on every tick. |
-| **Max order qty** | Single order cannot exceed configured size |
-| **Position limit** | Resulting position cannot exceed `max_position_qty` |
-| **Notional cap** | Exposure cannot exceed `max_notional` per symbol |
-| **Open orders** | Cannot exceed `max_open_orders` simultaneously |
-| **Rate limiter** | Max `max_orders_per_second` to avoid exchange bans |
-
-### Tier 2 — Circuit Breaker (soft pause)
-
-Automatically pauses quoting on adverse patterns. Resets at UTC midnight via `daily_reset()`:
-
-| Trigger | Behavior |
-|---|---|
-| **Consecutive losses** | After N losing round-trips in a row → circuit breaker fires. A round-trip = position goes flat. Resets on first winning trade or daily reset. |
-| **Drawdown from peak** | When `(peak_pnl − current_pnl) / peak_pnl > max_drawdown_bps` → soft pause. Prevents giving back a winning session. |
-
-### Tier 3 — Kill Switch (hard stop)
-
-Global atomic boolean. Once fired, **all orders are rejected** until manual `reset_kill_switch()`:
-
-- Triggers when `total_pnl < max_loss` (absolute loss limit)
-- Dashboard `STOP ALL` also activates kill mode in the live loop
-- Only human override can restart — not automated
-
-### Daily Reset
-
-On UTC midnight (detected via heartbeat tick every 5s):
-- Circuit breaker cleared
-- Consecutive losses reset
-- PnL baseline and drawdown peak reset for a clean new session
-- New trading session starts clean
-
----
-
-## C++ Hot-Path (FFI)
-
-The performance-critical path — orderbook maintenance, microprice, signal computation, and quote generation — is implemented in C++17 and called via FFI through Rust's `cc` crate. Compiled with `-O3 -march=native` for native SIMD and branch prediction optimization.
-
-Spread configuration in the hot path is pipette-based (`half_spread_pipettes`), matching the integer `Price(i64)` model.
-
-```
+Computes the volume-weighted fair value from the order  v
 ┌─────────────────────────────────────────────────┐
 │  C++ Hot Path (atomic-hotpath crate)            │
 │                                                 │
@@ -319,7 +232,7 @@ cargo run --release -- --backtest data/events.log --metrics
 # Backtest with equity curve export
 cargo run --release -- --backtest data/events.log --equity-csv results.csv --metrics
 
-# Run all tests (85 tests across 12 crates)
+# Run all tests (92 tests across 12 crates)
 cargo test
 
 # Run Criterion benchmarks
@@ -376,17 +289,17 @@ All benchmarks use warm-cache methodology (1000-tick warmup) measured with [Crit
 |---|---|---|
 | `atomic-bus` | 3 | SPSC ring buffer: push, pop, wrap-around, full buffer |
 | `atomic-core` | 4 | Histogram record/percentile, StageTimer RAII, PipelineMetrics report |
-| `atomic-execution` | 11 | Order lifecycle, state transitions, market/limit fills, cancel, IOC, FOK |
+| `atomic-execution` | 12 | Order lifecycle, state transitions, market/limit fills, cancel, IOC, FOK, stale order detection |
 | `atomic-feed` | 5 | Feed normalization, snapshot/delta, trade parsing, symbol formats |
 | `atomic-hotpath` | 5 | C++ FFI: book update, trade, fill, quote generation, requote threshold |
-| `atomic-node` | 7 | Event dedup, recovery, E2E (3 integration tests), determinism (2 multi-node tests) |
+| `atomic-node` | 9 | Event dedup, recovery, E2E (5 integration tests incl. kill switch + stale detection), determinism (2 multi-node tests) |
 | `atomic-orderbook` | 3 | Book snapshot, delta update, simulated fill |
 | `atomic-replay` | 2 | Deterministic replay hash, snapshot restore hash |
-| `atomic-risk` | 11 | Kill switch, rate limit, position limit, order qty, PnL tracking, daily-reset baseline |
+| `atomic-risk` | 15 | Kill switch, rate limit, position limit, order qty, PnL tracking, daily-reset, total notional, spread gate, circuit breaker, drawdown |
 | `atomic-router` | 6 | BestVenue buy/sell, VWAP split, TWAP split, liquidity sweep, empty book |
 | `atomic-strategy` | 21 | Microprice (5), inventory (7), VPIN toxicity (5), A-S market maker (4) |
 | `atomic-transport` | 7 | Wire protocol roundtrip: heartbeat, replication, batch, sync, consensus, hash |
-| **Total** | **85** | **12 crates, 0 failures** |
+| **Total** | **92** | **12 crates, 0 failures** |
 
 ---
 

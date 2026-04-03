@@ -275,3 +275,147 @@ fn e2e_risk_engine_tracks_consistently() {
         risk.is_circuit_breaker()
     );
 }
+
+/// E2E: kill switch fires → all subsequent orders rejected, open orders cancellable.
+#[test]
+fn e2e_kill_switch_blocks_orders_and_cancels_open() {
+    let mut hotpath = HotPathEngine::new(100_000, 20_000_000, 10, 1000, 3, 2, 5, true);
+    let mut sim = SimulatedExchange::new(SimulatorConfig::default());
+    let mut execution = ExecutionEngine::new();
+    let mut risk = RiskEngine::new(RiskLimits::default());
+    let source = [0u8; 32];
+
+    let events = generate_synthetic_events(500);
+    let mut next_seq = 5000u64;
+    let mut orders_before_kill = 0u64;
+    let mut orders_rejected_after_kill = 0u64;
+
+    // Phase 1: run normally for 200 events to build some orders
+    for event in &events[..200] {
+        if let EventPayload::OrderBookUpdate(book) = &event.payload {
+            sim.on_book_update(&book.symbol, &book.bids, &book.asks, book.is_snapshot);
+            if let (Some(b), Some(a)) = (book.bids.first(), book.asks.first()) {
+                risk.update_spread(a.price.0 - b.price.0);
+            }
+            let result = hotpath.on_book_update(&book.bids, &book.asks, book.is_snapshot);
+            for i in 0..result.count as usize {
+                let cmd = &result.commands[i];
+                if cmd.tag == HpCmdTag::PlaceBid as i32 || cmd.tag == HpCmdTag::PlaceAsk as i32 {
+                    let side = if cmd.tag == HpCmdTag::PlaceBid as i32 { Side::Buy } else { Side::Sell };
+                    let order_id = execution.next_order_id(Venue::Simulated);
+                    let check = risk.check_order(&sym(), side, Qty(cmd.qty), Price(cmd.price), None, event.timestamp);
+                    if check.is_ok() {
+                        let order_new = OrderNewEvent {
+                            order_id: order_id.clone(),
+                            symbol: sym(),
+                            side,
+                            order_type: OrderType::Limit,
+                            price: Price(cmd.price),
+                            qty: Qty(cmd.qty),
+                            time_in_force: TimeInForce::GoodTilCancel,
+                            venue: Venue::Simulated,
+                        };
+                        let order_event = Event::new(0, event.timestamp, source, EventPayload::OrderNew(order_new.clone()));
+                        let _ = execution.process_event(&order_event);
+                        sim.submit_order(&order_new, event.timestamp, source);
+                        risk.on_order_opened();
+                        orders_before_kill += 1;
+                        next_seq += 1;
+                    }
+                }
+            }
+        }
+        let sim_events = sim.drain_events(next_seq);
+        next_seq += sim_events.len() as u64;
+        for sim_ev in &sim_events {
+            let _ = execution.process_event(sim_ev);
+            if matches!(&sim_ev.payload, EventPayload::OrderFill(_)) {
+                risk.on_order_closed();
+            }
+        }
+    }
+
+    // Phase 2: activate kill switch
+    risk.activate_kill_switch("E2E test kill");
+    assert!(risk.is_killed());
+
+    // Cancel all open orders
+    let open_before = execution.open_order_ids();
+    for oid in &open_before {
+        sim.cancel_order(oid, 999_999_999, source);
+    }
+    let cancel_events = sim.drain_events(next_seq);
+    next_seq += cancel_events.len() as u64;
+    for ev in &cancel_events {
+        let _ = execution.process_event(ev);
+        risk.on_order_closed();
+    }
+
+    // Phase 3: try to submit new orders after kill — all must be rejected
+    for event in &events[200..400] {
+        if let EventPayload::OrderBookUpdate(book) = &event.payload {
+            let result = hotpath.on_book_update(&book.bids, &book.asks, book.is_snapshot);
+            for i in 0..result.count as usize {
+                let cmd = &result.commands[i];
+                if cmd.tag == HpCmdTag::PlaceBid as i32 || cmd.tag == HpCmdTag::PlaceAsk as i32 {
+                    let side = if cmd.tag == HpCmdTag::PlaceBid as i32 { Side::Buy } else { Side::Sell };
+                    let check = risk.check_order(&sym(), side, Qty(cmd.qty), Price(cmd.price), None, event.timestamp);
+                    assert!(check.is_err(), "All orders must be rejected when kill switch is active");
+                    orders_rejected_after_kill += 1;
+                }
+            }
+        }
+    }
+
+    assert!(orders_before_kill > 0, "Must have placed orders before kill");
+    assert!(orders_rejected_after_kill > 0, "Must have attempted orders after kill");
+    assert!(execution.open_order_ids().is_empty(), "No open orders after cancel-all");
+    println!(
+        "Kill switch OK: {} orders before, {} rejected after, open={}",
+        orders_before_kill, orders_rejected_after_kill, execution.open_order_ids().len()
+    );
+}
+
+/// E2E: stale order detection finds orders stuck in Ack state.
+#[test]
+fn e2e_stale_order_detection() {
+    let mut execution = ExecutionEngine::new();
+
+    // Create and ack an order at ts=1000
+    let oid = execution.next_order_id(Venue::Simulated);
+    let order = atomic_execution::LiveOrder::new(
+        oid.clone(),
+        sym(),
+        Side::Buy,
+        OrderType::Limit,
+        Price(70_000_00),
+        Qty(100_000),
+        TimeInForce::GoodTilCancel,
+        Venue::Simulated,
+        1000,
+    );
+    execution.register_order(order).unwrap();
+    execution.on_ack(&oid.0, "EX1".into(), 2000).unwrap();
+
+    // Create a fresh order at ts=50_000
+    let oid2 = execution.next_order_id(Venue::Simulated);
+    let order2 = atomic_execution::LiveOrder::new(
+        oid2.clone(),
+        sym(),
+        Side::Sell,
+        OrderType::Limit,
+        Price(70_100_00),
+        Qty(100_000),
+        TimeInForce::GoodTilCancel,
+        Venue::Simulated,
+        50_000,
+    );
+    execution.register_order(order2).unwrap();
+    execution.on_ack(&oid2.0, "EX2".into(), 50_000).unwrap();
+
+    // At now=60_000 with timeout=30_000: only oid (updated at 2000) is stale
+    let stale = execution.stale_order_ids(60_000, 30_000);
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0], oid);
+    println!("Stale detection OK: found {} stale order(s)", stale.len());
+}

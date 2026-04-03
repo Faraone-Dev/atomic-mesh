@@ -335,7 +335,8 @@ impl ExecutionGateway {
     /// Start Binance user data stream to receive execution reports (fills).
     /// Creates a listenKey, opens a WebSocket, and spawns a background task
     /// that parses `executionReport` events into OrderFill/OrderCancel events.
-    pub async fn start_user_data_stream(&self) {
+    /// Returns the task handle so the caller can abort it on shutdown.
+    pub async fn start_user_data_stream(&self) -> Option<tokio::task::JoinHandle<()>> {
         let api_key = self.config.api_key.clone();
         let _api_secret = self.config.api_secret.clone();
         let base_url = self.config.base_url.clone();
@@ -351,7 +352,7 @@ impl ExecutionGateway {
             Some(k) => k,
             None => {
                 warn!("User data stream unavailable (testnet may not support it) — fills via REST only");
-                return;
+                return None;
             }
         };
         info!("User data stream listenKey created: {}...", &listen_key[..8.min(listen_key.len())]);
@@ -364,7 +365,7 @@ impl ExecutionGateway {
         };
         let ws_url = format!("{}/ws/{}", ws_base, listen_key);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut backoff_ms: u64 = 1000;
             let mut seq_counter: u64 = 900_000_000; // high range to avoid collision with market data seq
 
@@ -438,6 +439,8 @@ impl ExecutionGateway {
                 backoff_ms = (backoff_ms * 2).min(30_000);
             }
         });
+
+        Some(handle)
     }
 
     async fn handle_order_response(
