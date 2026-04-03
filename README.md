@@ -88,6 +88,12 @@ Dedicated risk panel with live limits, drawdown tracking, and emergency controls
 - Dashboard kill actions are wired into the live loop and trigger real cancel/kill workflows.
 - Backtest + E2E/determinism paths register `OrderNew` before simulator acks/fills, so lifecycle validation matches production state-machine semantics.
 
+## Known Gaps (Concise)
+
+- Multi-symbol risk/exposure aggregation is still single-position centric in live accounting and dashboard views.
+- `DISCONNECT` currently cancels open orders but does not fully tear down gateway/user-data sessions.
+- Backtest remains synthetic-data based; live-paper forward stats are still needed for market-edge validation.
+
 ---
 
 ## Strategy: Avellaneda-Stoikov Market Maker
