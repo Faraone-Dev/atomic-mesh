@@ -53,7 +53,7 @@ struct hp_engine {
     /* Strategy parameters (read-only after init) */
     alignas(HP_CACHELINE) struct {
         uint64_t order_qty;
-        int32_t  half_spread_bps;
+        int32_t  half_spread_pipettes;
         int32_t  warmup_ticks;
         int32_t  cooldown_ticks;
         int64_t  requote_threshold;
@@ -113,7 +113,7 @@ static hp_result_t generate_quotes(hp_engine* e, int64_t fair_value) {
     result.compute_ns  = 0;
 
     /* Fixed half-spread in pipettes (not bps) */
-    int64_t base_hs = e->params.half_spread_bps;  /* direct pipettes */
+    int64_t base_hs = e->params.half_spread_pipettes;
     if (base_hs < 1) base_hs = 1;
     int64_t multiplier = e->toxicity.spread_multiplier();
     int64_t half_spread = base_hs * multiplier / 10000;
@@ -171,7 +171,7 @@ extern "C" {
 hp_engine_t* hp_engine_create(
     uint64_t order_qty,
     int64_t  max_inventory,
-    int32_t  half_spread_bps,
+    int32_t  half_spread_pipettes,
     int32_t  gamma,
     int32_t  warmup_ticks,
     int32_t  cooldown_ticks,
@@ -180,7 +180,7 @@ hp_engine_t* hp_engine_create(
 ) {
     auto* e = new hp_engine();
     e->params.order_qty          = order_qty;
-    e->params.half_spread_bps    = half_spread_bps;
+    e->params.half_spread_pipettes = half_spread_pipettes;
     e->params.warmup_ticks       = warmup_ticks;
     e->params.cooldown_ticks     = cooldown_ticks;
     e->params.requote_threshold  = requote_threshold;

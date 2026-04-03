@@ -72,7 +72,7 @@ extern "C" {
     fn hp_engine_create(
         order_qty: u64,
         max_inventory: i64,
-        half_spread_bps: i32,
+        half_spread_pipettes: i32,
         gamma: i32,
         warmup_ticks: i32,
         cooldown_ticks: i32,
@@ -135,7 +135,7 @@ impl HotPathEngine {
     pub fn new(
         order_qty: u64,
         max_inventory: i64,
-        half_spread_bps: i32,
+        half_spread_pipettes: i32,
         gamma: i32,
         warmup_ticks: i32,
         cooldown_ticks: i32,
@@ -146,7 +146,7 @@ impl HotPathEngine {
             hp_engine_create(
                 order_qty,
                 max_inventory,
-                half_spread_bps,
+                half_spread_pipettes,
                 gamma,
                 warmup_ticks,
                 cooldown_ticks,

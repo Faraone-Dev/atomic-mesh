@@ -80,7 +80,7 @@ fn run_pipeline(events: &[Event]) -> (i64, u64, [u8; 8]) {
     let mut hotpath = HotPathEngine::new(
         100_000,    // order_qty
         20_000_000, // max_inventory
-        10,         // half_spread_bps
+        10,         // half_spread_pipettes
         1000,       // gamma
         3,          // warmup
         2,          // cooldown

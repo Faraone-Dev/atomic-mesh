@@ -252,7 +252,7 @@ impl RiskEngine {
     pub fn daily_reset(&mut self) {
         self.circuit_breaker = false;
         self.consecutive_losses = 0;
-        self.peak_pnl = self.total_pnl; // new session starts from current PnL
+        self.peak_pnl = 0;
         self.total_pnl = 0;
         tracing::info!("Risk daily reset: circuit breaker cleared, PnL zeroed");
     }
@@ -385,5 +385,21 @@ mod tests {
         // Within limit
         let result = risk.check_order(&sym(), Side::Buy, Qty(800), Price(1), Some(&pos), 0);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn daily_reset_clears_pnl_and_peak() {
+        let mut risk = engine(RiskLimits::default());
+        risk.update_pnl(1_000);
+        risk.update_pnl(-250);
+        assert!(risk.peak_pnl() > 0);
+        assert!(risk.total_pnl() > 0);
+
+        risk.daily_reset();
+
+        assert_eq!(risk.total_pnl(), 0);
+        assert_eq!(risk.peak_pnl(), 0);
+        assert_eq!(risk.consecutive_losses(), 0);
+        assert!(!risk.is_circuit_breaker());
     }
 }

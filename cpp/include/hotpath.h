@@ -73,7 +73,7 @@ typedef struct hp_engine hp_engine_t;
  * Create a new hot-path engine. Call ONCE at startup.
  *   order_qty     : default order quantity (base units)
  *   max_inventory : maximum inventory (base units)
- *   half_spread_bps: half-spread in basis points
+ *   half_spread_pipettes: half-spread in pipettes
  *   gamma         : risk aversion × 10000
  *   warmup_ticks  : ticks before first quote
  *   cooldown_ticks: min ticks between requotes
@@ -82,7 +82,7 @@ typedef struct hp_engine hp_engine_t;
 hp_engine_t* hp_engine_create(
     uint64_t order_qty,
     int64_t  max_inventory,
-    int32_t  half_spread_bps,
+    int32_t  half_spread_pipettes,
     int32_t  gamma,
     int32_t  warmup_ticks,
     int32_t  cooldown_ticks,

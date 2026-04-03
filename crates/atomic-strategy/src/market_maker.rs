@@ -22,8 +22,8 @@ pub struct MarketMaker {
     toxicity: ToxicityTracker,
 
     // --- quoting params ---
-    /// Base half-spread in basis points (e.g. 5 = 0.05 %).
-    half_spread_bps: i64,
+    /// Base half-spread in pipettes (e.g. 15 = $0.15 at 2 decimals).
+    half_spread_pipettes: i64,
     /// Minimum fair-value move (pipettes) to trigger requote.
     requote_threshold: i64,
     /// Per-order quantity (satoshis).
@@ -55,7 +55,7 @@ impl MarketMaker {
         venue: Venue,
         order_qty: u64,
         max_inventory: i64,
-        half_spread_bps: i64,
+        half_spread_pipettes: i64,
         gamma: i64,
     ) -> Self {
         Self {
@@ -65,7 +65,7 @@ impl MarketMaker {
             // VPIN window = 200 trades, α = 0.05, toxic threshold = 60 %
             inventory: InventoryManager::new(max_inventory, gamma),
             toxicity: ToxicityTracker::new(200, 500, 6000),
-            half_spread_bps,
+            half_spread_pipettes,
             requote_threshold: 10, // $0.10 at 2 decimals
             order_qty,
             microprice_depth: 5,
@@ -94,7 +94,7 @@ impl MarketMaker {
         }
 
         // Fixed half-spread in pipettes (not bps)
-        let base_hs = self.half_spread_bps.max(1);
+        let base_hs = self.half_spread_pipettes.max(1);
         let multiplier = self.toxicity.spread_multiplier(); // 10 000 – 30 000
         let half_spread = base_hs * multiplier / 10000;
 
@@ -266,7 +266,7 @@ mod tests {
             Venue::Binance,
             10_000_000,   // 0.1 BTC
             100_000_000,  // 1 BTC max
-            5,            // 0.05 % half-spread
+            5,            // 5 pipettes half-spread ($0.05)
             5000,         // γ = 0.5
         )
     }

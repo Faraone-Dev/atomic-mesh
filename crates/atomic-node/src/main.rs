@@ -6,7 +6,7 @@ use tracing::{info, warn, error};
 use atomic_core::clock::{LamportClock, SequenceGenerator, WallClock};
 use atomic_core::event::{Event, EventPayload};
 use atomic_core::metrics::PipelineMetrics;
-use atomic_core::types::{OrderId, Venue};
+use atomic_core::types::{OrderId, Symbol, Venue};
 use atomic_bus::EventSequencer;
 use atomic_execution::{ExecutionEngine, SimulatedExchange, SimulatorConfig, StateVerifier};
 use atomic_feed::{FeedNormalizer, ExecutionGateway, GatewayConfig};
@@ -65,6 +65,30 @@ struct Cli {
     /// Export backtest equity curve to CSV file
     #[arg(long)]
     equity_csv: Option<String>,
+}
+
+fn parse_venue_symbol(raw: &str, venue: Venue) -> Symbol {
+    let upper = raw.to_uppercase();
+    const QUOTES: [&str; 11] = [
+        "USDT", "USDC", "BUSD", "FDUSD", "BTC", "ETH", "EUR", "USD", "TRY", "BNB", "JPY",
+    ];
+
+    for quote in QUOTES {
+        if upper.ends_with(quote) && upper.len() > quote.len() {
+            let base = &upper[..upper.len() - quote.len()];
+            return Symbol::new(base, quote, venue);
+        }
+    }
+
+    if upper.len() > 4 {
+        let split = upper.len() - 4;
+        return Symbol::new(&upper[..split], &upper[split..], venue);
+    }
+    if upper.len() > 3 {
+        let split = upper.len() - 3;
+        return Symbol::new(&upper[..split], &upper[split..], venue);
+    }
+    Symbol::new(&upper, "USDT", venue)
 }
 
 #[tokio::main]
@@ -264,6 +288,13 @@ async fn main() {
     );
     info!("C++ hot-path engine initialized");
 
+    let primary_symbol_obj = config
+        .feeds
+        .first()
+        .and_then(|f| f.symbols.first().map(|s| parse_venue_symbol(s, f.venue)))
+        .unwrap_or_else(|| parse_venue_symbol("BTCUSDT", Venue::Binance));
+    let primary_symbol_code = format!("{}{}", primary_symbol_obj.base, primary_symbol_obj.quote);
+
     // Compute node ID bytes (used by gateway + mesh)
     let node_id_bytes = {
         let mut id = [0u8; 32];
@@ -310,7 +341,7 @@ async fn main() {
 
         // Seed MM with initial inventory via market buy (testnet only)
         if config.gateway.is_testnet() {
-            let seed_sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
+            let seed_sym = primary_symbol_obj.clone();
             let seed_oid = OrderId("seed-buy-1".to_string());
             gw.submit_order(
                 &seed_oid,
@@ -465,12 +496,6 @@ async fn main() {
     let mut cost_basis: i64 = 0;         // total cost in pipettes (price * qty / qty_divisor)
     let mut realized_pnl: i64 = 0;       // cumulative realized PnL in pipettes
     let mut last_flat_pnl: i64 = 0;      // PnL snapshot at last flat position (for round-trip tracking)
-    let primary_symbol = config
-        .feeds
-        .first()
-        .and_then(|f| f.symbols.first())
-        .cloned()
-        .unwrap_or_else(|| "BTCUSDT".to_string());
 
     loop {
         tokio::select! {
@@ -557,13 +582,14 @@ async fn main() {
                         let open_ids = execution.open_order_ids();
                         if let Some(ref gw) = gateway {
                             let gw = Arc::clone(gw);
-                            let sym = primary_symbol.clone();
+                            let sym = primary_symbol_code.clone();
                             tokio::spawn(async move {
                                 gw.cancel_all_open_orders(&sym).await;
                             });
-                        }
-                        for _ in &open_ids {
-                            risk.on_order_closed();
+                        } else {
+                            for _ in &open_ids {
+                                risk.on_order_closed();
+                            }
                         }
                         warn!("Dashboard kill action: STOP ALL executed (kill switch active)");
                     }
@@ -571,13 +597,14 @@ async fn main() {
                         let open_ids = execution.open_order_ids();
                         if let Some(ref gw) = gateway {
                             let gw = Arc::clone(gw);
-                            let sym = primary_symbol.clone();
+                            let sym = primary_symbol_code.clone();
                             tokio::spawn(async move {
                                 gw.cancel_all_open_orders(&sym).await;
                             });
-                        }
-                        for _ in &open_ids {
-                            risk.on_order_closed();
+                        } else {
+                            for _ in &open_ids {
+                                risk.on_order_closed();
+                            }
                         }
                         warn!("Dashboard kill action: CANCEL ALL executed");
                     }
@@ -585,13 +612,14 @@ async fn main() {
                         let open_ids = execution.open_order_ids();
                         if let Some(ref gw) = gateway {
                             let gw = Arc::clone(gw);
-                            let sym = primary_symbol.clone();
+                            let sym = primary_symbol_code.clone();
                             tokio::spawn(async move {
                                 gw.cancel_all_open_orders(&sym).await;
                             });
-                        }
-                        for _ in &open_ids {
-                            risk.on_order_closed();
+                        } else {
+                            for _ in &open_ids {
+                                risk.on_order_closed();
+                            }
                         }
                         warn!("Dashboard kill action: DISCONNECT requested (gateway sessions cannot be force-closed yet, orders canceled)");
                     }
@@ -621,36 +649,41 @@ async fn main() {
                 drop(_stimer);
 
                 // Convert C++ hot-path commands to StrategyCommands
-                let sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
+                let cmd_symbol = match &event.payload {
+                    EventPayload::OrderBookUpdate(obu) => obu.symbol.clone(),
+                    EventPayload::Trade(t) => t.symbol.clone(),
+                    EventPayload::OrderFill(fill) | EventPayload::OrderPartialFill(fill) => fill.symbol.clone(),
+                    _ => primary_symbol_obj.clone(),
+                };
                 let mut commands = Vec::new();
                 for i in 0..hp_result.count {
                     let cmd = &hp_result.commands[i as usize];
                     match cmd.tag {
                         1 => { // HP_CMD_PLACE_BID
                             commands.push(atomic_strategy::StrategyCommand::PlaceOrder {
-                                symbol: sym.clone(),
+                                symbol: cmd_symbol.clone(),
                                 side: atomic_core::types::Side::Buy,
                                 order_type: atomic_core::types::OrderType::Limit,
                                 price: atomic_core::types::Price(cmd.price),
                                 qty: atomic_core::types::Qty(cmd.qty),
                                 time_in_force: atomic_core::types::TimeInForce::GoodTilCancel,
-                                venue: Venue::Binance,
+                                venue: cmd_symbol.venue,
                             });
                         }
                         2 => { // HP_CMD_PLACE_ASK
                             commands.push(atomic_strategy::StrategyCommand::PlaceOrder {
-                                symbol: sym.clone(),
+                                symbol: cmd_symbol.clone(),
                                 side: atomic_core::types::Side::Sell,
                                 order_type: atomic_core::types::OrderType::Limit,
                                 price: atomic_core::types::Price(cmd.price),
                                 qty: atomic_core::types::Qty(cmd.qty),
                                 time_in_force: atomic_core::types::TimeInForce::GoodTilCancel,
-                                venue: Venue::Binance,
+                                venue: cmd_symbol.venue,
                             });
                         }
                         3 => { // HP_CMD_CANCEL_ALL
                             commands.push(atomic_strategy::StrategyCommand::CancelAll {
-                                symbol: Some(sym.clone()),
+                                symbol: Some(cmd_symbol.clone()),
                             });
                         }
                         _ => {}
@@ -780,6 +813,11 @@ async fn main() {
                             let exposure_pipettes = (position_qty.unsigned_abs() as i64)
                                 .saturating_mul(last_mid_price_pipettes)
                                 / qty_divisor;
+                            let drawdown_pct = if risk.peak_pnl() > 0 {
+                                (risk.peak_pnl() - risk.total_pnl()) as f64 / risk.peak_pnl() as f64 * 100.0
+                            } else {
+                                0.0
+                            };
                             let _ = dash_tx.send(DashboardEvent::Risk {
                                 open_orders: risk.open_order_count() as u64,
                                 max_open: config.risk.max_open_orders as u64,
@@ -787,16 +825,18 @@ async fn main() {
                                 max_daily_loss: format!("{:.2}", config.risk.max_loss as f64 / price_divisor),
                                 exposure: format!("{:.2}", exposure_pipettes as f64 / price_divisor),
                                 max_exposure: format!("{:.2}", config.risk.max_notional as f64 / price_divisor),
-                                drawdown_pct: "0.00".to_string(),
-                                max_drawdown_pct: "0.00".to_string(),
+                                drawdown_pct: format!("{:.2}", drawdown_pct),
+                                max_drawdown_pct: format!("{:.2}", config.risk.max_drawdown_bps as f64 / 100.0),
                             });
                         }
                         atomic_strategy::StrategyCommand::CancelOrder { order_id } => {
                             if let Some(ref gw) = gateway {
                                 let gw = Arc::clone(gw);
                                 let oid = order_id.clone();
-                                // Get symbol from execution engine for cancel
-                                let sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
+                                let sym = execution
+                                    .get_order(&oid.0)
+                                    .map(|o| o.symbol.clone())
+                                    .unwrap_or_else(|| primary_symbol_obj.clone());
                                 let seq = last_seq;
                                 let ts = wall_clock.now_nanos();
                                 tokio::spawn(async move {
@@ -808,19 +848,19 @@ async fn main() {
                             }
                         }
                         atomic_strategy::StrategyCommand::CancelAll { symbol } => {
+                            let open_ids = execution.open_order_ids();
                             if let Some(ref gw) = gateway {
                                 let gw = Arc::clone(gw);
                                 let sym_str = symbol.as_ref()
                                     .map(|s| format!("{}{}", s.base, s.quote))
-                                    .unwrap_or_else(|| "BTCUSDT".to_string());
+                                    .unwrap_or_else(|| primary_symbol_code.clone());
                                 tokio::spawn(async move {
                                     gw.cancel_all_open_orders(&sym_str).await;
                                 });
-                            }
-                            // Clear tracked orders
-                            let open_ids = execution.open_order_ids();
-                            for _oid in &open_ids {
-                                risk.on_order_closed();
+                            } else {
+                                for _ in &open_ids {
+                                    risk.on_order_closed();
+                                }
                             }
                             info!("CANCEL ALL: {:?}", symbol);
                         }
@@ -982,7 +1022,7 @@ async fn main() {
                             if let Some(ref gw) = gateway {
                                 let gw = Arc::clone(gw);
                                 let reseed_id = OrderId(format!("reseed-{}", last_seq));
-                                let sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
+                                let sym = primary_symbol_obj.clone();
                                 info!("🔄 RESEED: inventory=0, sending market buy (testnet)");
                                 tokio::spawn(async move {
                                     gw.submit_order(
@@ -1017,6 +1057,11 @@ async fn main() {
                         let exposure_pipettes = (position_qty.unsigned_abs() as i64)
                             .saturating_mul(last_mid_price_pipettes)
                             / qty_divisor;
+                        let drawdown_pct = if risk.peak_pnl() > 0 {
+                            (risk.peak_pnl() - risk.total_pnl()) as f64 / risk.peak_pnl() as f64 * 100.0
+                        } else {
+                            0.0
+                        };
                         let _ = dash_tx.send(DashboardEvent::Risk {
                             open_orders: risk.open_order_count() as u64,
                             max_open: config.risk.max_open_orders as u64,
@@ -1024,8 +1069,8 @@ async fn main() {
                             max_daily_loss: format!("{:.2}", config.risk.max_loss as f64 / price_divisor),
                             exposure: format!("{:.2}", exposure_pipettes as f64 / price_divisor),
                             max_exposure: format!("{:.2}", config.risk.max_notional as f64 / price_divisor),
-                            drawdown_pct: "0.00".to_string(),
-                            max_drawdown_pct: "0.00".to_string(),
+                            drawdown_pct: format!("{:.2}", drawdown_pct),
+                            max_drawdown_pct: format!("{:.2}", config.risk.max_drawdown_bps as f64 / 100.0),
                         });
                     }
                     EventPayload::OrderReject(reject) => {
@@ -1155,7 +1200,7 @@ async fn main() {
                 // Push Strategy info on heartbeat
                 let _ = dash_tx.send(DashboardEvent::Strategy {
                     id: "market-maker-as".to_string(),
-                    symbol: "BTCUSDT".to_string(),
+                    symbol: primary_symbol_code.clone(),
                     enabled: true,
                     signals: metrics.total_events.load(Ordering::Relaxed),
                     orders: metrics.total_orders.load(Ordering::Relaxed),
@@ -1186,7 +1231,10 @@ async fn main() {
     info!("Draining — cancelling open orders on exchange...");
     if let Some(ref gw) = gateway {
         for oid in execution.open_order_ids() {
-            let sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
+            let sym = execution
+                .get_order(&oid.0)
+                .map(|o| o.symbol.clone())
+                .unwrap_or_else(|| primary_symbol_obj.clone());
             gw.cancel_order(&oid, &sym, last_seq, wall_clock.now_nanos()).await;
         }
         info!("All open orders cancelled.");
@@ -1358,9 +1406,19 @@ fn run_backtest(
     let mut trade_pnls: Vec<f64> = Vec::new();
     let mut last_flat_pnl: f64 = 0.0;
 
-    let sym = atomic_core::types::Symbol::new("BTC", "USDT", Venue::Binance);
+    let fallback_symbol = config
+        .feeds
+        .first()
+        .and_then(|f| f.symbols.first().map(|s| parse_venue_symbol(s, f.venue)))
+        .unwrap_or_else(|| parse_venue_symbol("BTCUSDT", Venue::Simulated));
 
     while let Some(event) = player.next() {
+        let order_symbol = match &event.payload {
+            EventPayload::OrderBookUpdate(obu) => obu.symbol.clone(),
+            EventPayload::Trade(t) => t.symbol.clone(),
+            _ => fallback_symbol.clone(),
+        };
+
         // Feed market data to simulator
         if let EventPayload::OrderBookUpdate(ref obu) = event.payload {
             sim.on_book_update(&obu.symbol, &obu.bids, &obu.asks, obu.is_snapshot);
@@ -1386,7 +1444,7 @@ fn run_backtest(
                     let order_id = execution.next_order_id(Venue::Simulated);
                     let order_new = atomic_core::event::OrderNewEvent {
                         order_id,
-                        symbol: sym.clone(),
+                        symbol: order_symbol.clone(),
                         side: atomic_core::types::Side::Buy,
                         order_type: atomic_core::types::OrderType::Limit,
                         price: atomic_core::types::Price(cmd.price),
@@ -1408,7 +1466,7 @@ fn run_backtest(
                     let order_id = execution.next_order_id(Venue::Simulated);
                     let order_new = atomic_core::event::OrderNewEvent {
                         order_id,
-                        symbol: sym.clone(),
+                        symbol: order_symbol.clone(),
                         side: atomic_core::types::Side::Sell,
                         order_type: atomic_core::types::OrderType::Limit,
                         price: atomic_core::types::Price(cmd.price),
