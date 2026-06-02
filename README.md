@@ -108,6 +108,7 @@ The core strategy implements the [Avellaneda-Stoikov (2008)](https://doi.org/10.
 
 Computes the volume-weighted fair value from the order book, trade flow and inventory state.
 
+```
 ┌─────────────────────────────────────────────────┐
 │  C++ Hot Path (atomic-hotpath crate)            │
 │                                                 │
