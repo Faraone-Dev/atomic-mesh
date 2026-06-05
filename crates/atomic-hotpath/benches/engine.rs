@@ -86,5 +86,32 @@ fn bench_book_update_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_on_book_update, bench_on_trade, bench_full_tick_cycle, bench_book_update_scaling);
+/// End-to-end benchmark: simulates the full pipeline
+/// from book update → trade → fill in one tight loop.
+/// This is the closest we can get to a real tick without network.
+fn bench_end_to_end(c: &mut Criterion) {
+    let mut engine = make_engine();
+    let (bids, asks) = make_book(20);
+    // Warm cache + engine state (1000 rounds like production warmup)
+    for _ in 0..1000 {
+        let _ = engine.on_book_update(&bids, &asks, true);
+        let _ = engine.on_trade(Side::Buy, Price(7_322_400), Qty(5_000_000));
+        engine.on_fill(Side::Buy, Qty(100_000), Price(7_322_300));
+    }
+
+    c.bench_function("end_to_end_pipeline (book+trade+fill, warm)", |b| {
+        b.iter(|| {
+            // 1. Book update → returns HpResult with quotes
+            let r1 = engine.on_book_update(&bids, &asks, false);
+            // 2. Trade event → updates VPIN + vol
+            let r2 = engine.on_trade(Side::Buy, Price(7_322_400), Qty(5_000_000));
+            // 3. Fill event → updates inventory
+            engine.on_fill(Side::Buy, Qty(100_000), Price(7_322_300));
+            // r1 contains the generated quotes (up to 4 commands)
+            black_box((r1, r2))
+        })
+    });
+}
+
+criterion_group!(benches, bench_on_book_update, bench_on_trade, bench_full_tick_cycle, bench_book_update_scaling, bench_end_to_end);
 criterion_main!(benches);

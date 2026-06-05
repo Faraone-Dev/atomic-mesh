@@ -31,24 +31,28 @@ Atomic Mesh is a high-frequency market-making system designed for institutional-
                     ┌─────────────────────────────────────────────────┐
                     │               ATOMIC MESH NODE                  │
                     │                                                 │
-  Exchange WS ────►│  Feed ───► Bus ───► Strategy ───► Router        │
-  (depth20 +       │  Handler   (SPSC    A-S MM +       (SOR)        │
-   trade stream)   │  + Norm    Ring)    C++ HP FFI        │         │
-                    │     │        │        │               ▼         │
-                    │  Metrics  Metrics  Metrics      Execution ◄─ Risk
-                    │  (per     (per     (431ns)      Engine      Engine
-                    │   stage)   stage)     │            │            │
-                    │                      ▼            ▼            │
-                    │                Event Log     Exchange API      │
-                    │               (append-only)  (Live / Sim)      │
-                    │                      │                         │
-                    │               State Verifier                   │
-                    │               (xxHash3 periodic)               │
-                    └──────────┬───────────────────────┬─────────────┘
-                               │   QUIC Transport      │
-                    ┌──────────▼───────────────────────▼─────────────┐
-                    │   Peer Nodes (Replication + Recovery)          │
-                    └───────────────────────────────────────────────-┘
+  Exchange WS ────► │  Feed Handler ──► Bus ──► Strategy ──► Router  │
+  (depth20 +       │  + Norm       (SPSC    A-S MM +     (SOR)      │
+   trade stream)   │               Ring)    C++ HP FFI              │
+                    │     │            │        │                    │
+                    │     ▼            ▼        ▼                    │
+                    │  Metrics     Metrics   Metrics   Execution     │
+                    │  (feed)      (bus)     (431ns)   Engine ◄───   │
+                    │                              ┌────────┐  │     │
+                    │                              │  Risk  │  │     │
+                    │                              │ Engine │  │     │
+                    │                              └────────┘  │     │
+                    │                                  ▼       ▼     │
+                    │                Event Log     Exchange API     │
+                    │               (append-only)  (Live / Sim)     │
+                    │                      │                       │
+                    │               State Verifier                  │
+                    │               (xxHash3 periodic)              │
+                    └──────────────────────┬───────────────────────┘
+                                           │   QUIC Transport
+                    ┌──────────────────────▼───────────────────────┐
+                    │     Peer Nodes (Replication + Recovery)      │
+                    └──────────────────────────────────────────────┘
 ```
 
 ---
@@ -59,13 +63,13 @@ Real-time WebSocket dashboard with multi-panel monitoring, served over HTTP on p
 
 ### System — Cluster, Events & Latency
 
-![System Dashboard](dashboard-system.png)
+![System Dashboard](assets/screenshots/dashboard-system.png)
 
 Node cluster overview with live event stream and full **pipeline latency monitor** — tracks every stage from feed receive (34μs) through risk check (509ns) to order-to-fill (285ms). Strategy compute consistently under 1μs.
 
 ### Trading — P&L, Order Book & Execution
 
-![Trading Dashboard](dashboard-trading.png)
+![Trading Dashboard](assets/screenshots/dashboard-trading.png)
 
 Cumulative P&L with equity curve, live L2 order book (depth-20 with bid/ask imbalance), and order execution table with color-coded latency (green < 50ms, cyan < 200ms, yellow < 500ms, red > 500ms).
 
@@ -75,7 +79,7 @@ Avellaneda-Stoikov market maker internals: quote count, order/fill ratio, realiz
 
 ### Risk — Controls & Kill Switch
 
-![Risk Dashboard](dashboard-risk-panel.png)
+![Risk Dashboard](assets/screenshots/dashboard-risk-panel.png)
 
 Dedicated risk panel with live limits, drawdown tracking, and emergency controls (`STOP ALL`, `CANCEL ALL ORDERS`, `DISCONNECT`) routed to the live loop.
 
