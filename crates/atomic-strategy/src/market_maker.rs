@@ -62,9 +62,9 @@ impl MarketMaker {
             id: id.to_string(),
             symbol,
             venue,
-            // VPIN window = 200 trades, α = 0.05, toxic threshold = 60 %
+            // VPIN over 20 buckets of one order_qty each, α = 0.05, toxic threshold = 60 %
             inventory: InventoryManager::new(max_inventory, gamma),
-            toxicity: ToxicityTracker::new(200, 500, 6000),
+            toxicity: ToxicityTracker::new(order_qty, 20, 500, 6000),
             half_spread_pipettes,
             requote_threshold: 10, // $0.10 at 2 decimals
             order_qty,

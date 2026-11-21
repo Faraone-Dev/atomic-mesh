@@ -234,6 +234,7 @@ dependencies = [
  "atomic-core",
  "atomic-orderbook",
  "bincode",
+ "flowtox",
  "serde",
 ]
 
@@ -707,6 +708,12 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "flowtox"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d64da4aa09c4d87ba473b1002d66b72675126e799e762cd416c4f243757890c"
 
 [[package]]
 name = "fnv"

@@ -8,3 +8,4 @@ atomic-core = { path = "../atomic-core" }
 atomic-orderbook = { path = "../atomic-orderbook" }
 serde = { workspace = true }
 bincode = { workspace = true }
+flowtox = "0.1.1"
