@@ -1,19 +1,17 @@
 use atomic_core::types::Side;
-use std::collections::VecDeque;
+use flowtox::Vpin;
 
-/// Trade-flow toxicity tracker (VPIN-lite) + short-term volatility.
+/// Trade-flow toxicity tracker (VPIN) + short-term volatility.
 ///
-/// Detects "informed" order flow by measuring the imbalance between
-/// buy-initiated and sell-initiated volume in a rolling window.
+/// Detects "informed" order flow with volume-bucketed VPIN (Easley, Lopez de
+/// Prado, O'Hara 2012): the mean buy/sell imbalance over the last N
+/// equal-volume buckets, computed by `flowtox`.
 /// When VPIN is high → widen spread or pull quotes entirely.
 ///
 /// Also tracks volatility via EMA of absolute trade-to-trade price changes.
 pub struct ToxicityTracker {
-    /// Rolling window of (side, qty).
-    window: VecDeque<(Side, u64)>,
-    max_window: usize,
-    buy_volume: u64,
-    sell_volume: u64,
+    /// Volume-clock VPIN over the last `n_buckets` buckets.
+    vpin: Vpin,
     /// EMA of |Δprice| (volatility proxy, in pipettes).
     volatility_ema: i64,
     last_price: i64,
@@ -24,12 +22,10 @@ pub struct ToxicityTracker {
 }
 
 impl ToxicityTracker {
-    pub fn new(max_window: usize, vol_alpha: i64, threshold: i64) -> Self {
+    pub fn new(bucket_volume: u64, n_buckets: usize, vol_alpha: i64, threshold: i64) -> Self {
         Self {
-            window: VecDeque::with_capacity(max_window),
-            max_window,
-            buy_volume: 0,
-            sell_volume: 0,
+            vpin: Vpin::new(bucket_volume.max(1) as f64, n_buckets.max(1))
+                .expect("bucket volume and bucket count are positive"),
             volatility_ema: 0,
             last_price: 0,
             vol_alpha,
@@ -47,32 +43,19 @@ impl ToxicityTracker {
         }
         self.last_price = price;
 
-        // Add to rolling window
-        match side {
-            Side::Buy => self.buy_volume += qty,
-            Side::Sell => self.sell_volume += qty,
-        }
-        self.window.push_back((side, qty));
-
-        // Evict old
-        while self.window.len() > self.max_window {
-            if let Some((old_side, old_qty)) = self.window.pop_front() {
-                match old_side {
-                    Side::Buy => self.buy_volume = self.buy_volume.saturating_sub(old_qty),
-                    Side::Sell => self.sell_volume = self.sell_volume.saturating_sub(old_qty),
-                }
-            }
-        }
+        let side = match side {
+            Side::Buy => flowtox::Side::Buy,
+            Side::Sell => flowtox::Side::Sell,
+        };
+        self.vpin.update_side(side, qty as f64);
     }
 
-    /// VPIN = |buy_vol − sell_vol| / total_vol, scaled × 10 000.
+    /// VPIN = mean of |buy_vol − sell_vol| / bucket_vol over the last N
+    /// volume buckets, scaled × 10 000. Zero until N buckets have filled.
     pub fn vpin(&self) -> i64 {
-        let total = self.buy_volume + self.sell_volume;
-        if total == 0 {
-            return 0;
-        }
-        let diff = (self.buy_volume as i64 - self.sell_volume as i64).unsigned_abs();
-        (diff * 10000 / total) as i64
+        self.vpin
+            .value()
+            .map_or(0, |v| (v * 10000.0).round() as i64)
     }
 
     /// Is flow currently toxic?
@@ -101,7 +84,7 @@ mod tests {
 
     #[test]
     fn vpin_balanced_is_zero() {
-        let mut t = ToxicityTracker::new(100, 500, 6000);
+        let mut t = ToxicityTracker::new(200, 1, 500, 6000);
         t.on_trade(Side::Buy, 100, 1000);
         t.on_trade(Side::Sell, 100, 1001);
         assert_eq!(t.vpin(), 0);
@@ -109,7 +92,7 @@ mod tests {
 
     #[test]
     fn vpin_one_sided_is_max() {
-        let mut t = ToxicityTracker::new(100, 500, 6000);
+        let mut t = ToxicityTracker::new(100, 4, 500, 6000);
         for _ in 0..10 {
             t.on_trade(Side::Buy, 100, 1000);
         }
@@ -119,7 +102,7 @@ mod tests {
 
     #[test]
     fn volatility_increases_on_price_move() {
-        let mut t = ToxicityTracker::new(100, 5000, 6000);
+        let mut t = ToxicityTracker::new(100, 4, 5000, 6000);
         t.on_trade(Side::Buy, 100, 1000);
         t.on_trade(Side::Buy, 100, 1100); // Δ = 100
         assert!(t.volatility() > 0);
@@ -127,19 +110,34 @@ mod tests {
 
     #[test]
     fn spread_multiplier_baseline() {
-        let t = ToxicityTracker::new(100, 500, 6000);
+        let t = ToxicityTracker::new(100, 4, 500, 6000);
         assert_eq!(t.spread_multiplier(), 10000); // 1.0×
     }
 
     #[test]
-    fn window_eviction() {
-        let mut t = ToxicityTracker::new(3, 500, 6000);
-        t.on_trade(Side::Buy, 100, 1000);
-        t.on_trade(Side::Buy, 100, 1000);
-        t.on_trade(Side::Buy, 100, 1000);
-        t.on_trade(Side::Sell, 100, 1000); // oldest buy evicted
-        // 2 buys + 1 sell → vpin = 1/3 * 10000 ≈ 3333
-        let v = t.vpin();
-        assert!(v > 3000 && v < 4000, "expected ~3333, got {}", v);
+    fn one_sided_runs_are_toxic_even_when_totals_balance() {
+        // 200 bought, then 200 sold: total buy == total sell, so a plain
+        // window imbalance reads 0. Every 100-unit bucket is one-sided.
+        let mut t = ToxicityTracker::new(100, 4, 500, 6000);
+        for _ in 0..2 {
+            t.on_trade(Side::Buy, 100, 1000);
+        }
+        for _ in 0..2 {
+            t.on_trade(Side::Sell, 100, 1000);
+        }
+        assert_eq!(t.vpin(), 10000);
+        assert!(t.is_toxic());
+    }
+
+    #[test]
+    fn buckets_follow_volume_not_trade_count() {
+        // One 300-unit buy spans three buckets; ten 10-unit sells fill one.
+        let mut t = ToxicityTracker::new(100, 4, 500, 6000);
+        t.on_trade(Side::Buy, 300, 1000);
+        assert_eq!(t.vpin(), 0); // 3 of 4 buckets: not ready yet
+        for _ in 0..10 {
+            t.on_trade(Side::Sell, 10, 1000);
+        }
+        assert_eq!(t.vpin(), 10000);
     }
 }
